@@ -99,10 +99,10 @@ class PurePursuitNode(Node):
         self.k = 0.35
         self.kp = 0.5
         self.command_speed = 0.1
-        self.Ts = 0.01 #0.1
+        self.Ts = 0.01
         # Goal tolerance aligned with planner (typically 0.10 m),
         # set higher to prevent early stopping and allow planner to advance.
-        self.goal_tolerance = 0.2
+        self.goal_tolerance = 0.3
         self.publish_steering_in_degrees = True
         self.invert_steering_sign = False
         self.hagen_robot = HagenRobot(Ts=self.Ts, x=0.0, y=0.0, theta=0.0, v=0.0, L=0.5)
@@ -122,8 +122,10 @@ class PurePursuitNode(Node):
         self.stop_requested = False
         self.object_detections_count = 0
         self.obstacle_stop_requested = False
-        self.object_length_margin = 0.20  # [m]
-        self.object_width_margin = 0.05  # [m]
+        self.obstacle_distance_threshold = 3.0 #1.0
+        # Obstacle timeout: clear obstacle flag if no detections arrive within this window
+        self.last_detection_time = None
+        self.obstacle_timeout = 1.0  # seconds
 
         reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -164,17 +166,19 @@ class PurePursuitNode(Node):
             Detection3DArray,
             "/objects_in_map_frame",
             self.objects_in_map_frame_callback,
-            best_effort_qos,
+            reliable_qos,
         )
-
         self.kinematic_state_sub = self.create_subscription(
             KinematicState,
             "/kinematic_state",
             self.kinematic_state_callback,
             best_effort_qos,
         )
-        # Timer for control loop
+        # Control loop timer
         self.timer = self.create_timer(self.Ts, self.control_loop)
+        # Obstacle timeout timer: checks every 0.5s if detections have gone stale
+        #
+        self.obstacle_timeout_timer = self.create_timer(0.5, self._check_obstacle_timeout)
         self.get_logger().info("PurePursuitNode started.")
 
     def control_loop(self):
@@ -245,12 +249,26 @@ class PurePursuitNode(Node):
         drive_msg.acceleration = 0.0
         self.ackermann_pub.publish(drive_msg)
 
+    def _check_obstacle_timeout(self):
+        """
+        Clears obstacle_stop_requested if no detection messages have arrived recently.
+        This allows the robot to resume automatically when an obstacle leaves the frame.
+        """
+        if self.last_detection_time is None:
+            return
+        elapsed = (self.get_clock().now() - self.last_detection_time).nanoseconds / 1e9
+        if elapsed > self.obstacle_timeout and self.obstacle_stop_requested:
+            self.get_logger().info(
+                f"No detections for {elapsed:.1f}s — clearing obstacle, resuming operation."
+            )
+            self.obstacle_stop_requested = False
+            self.publish_obstacle_information()
+
     def robot_description_callback(self, msg):
         """
         Callback for /robot_description topic.
         """
         self.get_logger().info(f"Received /robot_description (length={len(msg.data)})")
-        # You can parse or store the robot description here if needed
 
     def path_callback(self, msg):
         """
@@ -266,7 +284,6 @@ class PurePursuitNode(Node):
         ref_x = [pose.pose.position.x for pose in msg.poses]
         ref_y = [pose.pose.position.y for pose in msg.poses]
 
-        # Update both node-level path and controller path
         self.ref_path_x = np.array(ref_x, dtype=float)
         self.ref_path_y = np.array(ref_y, dtype=float)
         self.controller.ref_path_x = self.ref_path_x
@@ -275,7 +292,8 @@ class PurePursuitNode(Node):
         self.goal_reached = False
 
         self.get_logger().info(
-            f"Updated controller path from /path with {pose_count} poses"
+            f"Updated controller path from /path with {pose_count} poses",
+             throttle_duration_sec=2.0,
         )
 
     def kinematic_state_callback(self, msg):
@@ -285,16 +303,15 @@ class PurePursuitNode(Node):
         pose = msg.pose_with_covariance.pose
         self.hagen_robot.x = pose.position.x
         self.hagen_robot.y = pose.position.y
-        # Optionally update theta from quaternion
         q = pose.orientation
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         self.hagen_robot.theta = math.atan2(siny_cosp, cosy_cosp)
-        # Optionally update velocity from twist
         self.hagen_robot.v = msg.twist_with_covariance.twist.linear.x
         self.kinematic_state_received = True
         self.get_logger().debug(
-            f"Updated robot pose from /kinematic_state: x={self.hagen_robot.x}, y={self.hagen_robot.y}, theta={self.hagen_robot.theta}, v={self.hagen_robot.v}"
+            f"Updated robot pose from /kinematic_state: x={self.hagen_robot.x}, y={self.hagen_robot.y}, "
+            f"theta={self.hagen_robot.theta}, v={self.hagen_robot.v}"
         )
 
     def ackermann_feedback_callback(self, msg):
@@ -322,17 +339,27 @@ class PurePursuitNode(Node):
     def objects_in_map_frame_callback(self, msg):
         """
         Callback for /objects_in_map_frame topic.
-        Stop logic: hold if robot is inside object footprint expanded by:
-          - 20 cm along object length
-          - 5 cm along object width
+        Stamps the last detection time on every message so the timeout timer
+        can detect when the obstacle has left the frame.
         """
+        self.last_detection_time = self.get_clock().now()
         self.object_detections_count = len(msg.detections)
+
         if not self.kinematic_state_received:
             self.obstacle_stop_requested = False
             return
 
         obstacle_close = False
         for detection in msg.detections:
+            if detection.results:
+                class_id = detection.results[0].hypothesis.class_id
+                score = detection.results[0].hypothesis.score
+                cx = float(detection.bbox.center.position.x)
+                cy = float(detection.bbox.center.position.y)
+                self.get_logger().info(
+                    f"center=({cx:.2f}, {cy:.2f}), "
+                    f"threshold={self.obstacle_distance_threshold:.2f}m"
+                )
             if self._is_obstacle_too_close(detection):
                 obstacle_close = True
                 break
@@ -347,27 +374,35 @@ class PurePursuitNode(Node):
 
     def _is_obstacle_too_close(self, detection):
         """
-        Returns True when robot is within the expanded 2D obstacle box.
+        Returns True when obstacle center.x is within obstacle_distance_threshold.
+        Only considers objects of class: car, person, plant.
         """
+        allowed_classes = {"car", "person", "plant"}
+
+        if not detection.results:
+            return False
+
+        class_name = detection.results[0].hypothesis.class_id.lower()
+        if class_name not in allowed_classes:
+            self.get_logger().debug(f"Ignoring object class: {class_name}")
+            return False
+
         bbox = detection.bbox
         center = bbox.center.position
-        q = bbox.center.orientation
+        cx = float(center.x)
 
-        yaw = self._yaw_from_quaternion(q.x, q.y, q.z, q.w)
-        dx = self.hagen_robot.x - float(center.x)
-        dy = self.hagen_robot.y - float(center.y)
+        is_too_close = cx < self.obstacle_distance_threshold
 
-        # Transform robot position into obstacle local frame.
-        x_local = math.cos(yaw) * dx + math.sin(yaw) * dy
-        y_local = -math.sin(yaw) * dx + math.cos(yaw) * dy
+        self.get_logger().debug(
+            f"[{class_name}] center.x={cx:.2f}m, threshold={self.obstacle_distance_threshold}m, too_close={is_too_close}"
+        )
+        if is_too_close:
+            self.get_logger().warn(
+                f"Obstacle too close! Class={class_name}, center.x={cx:.2f}m",
+                throttle_duration_sec=1.0,
+            )
 
-        half_length = max(0.0, float(bbox.size.x) * 0.5)
-        half_width = max(0.0, float(bbox.size.y) * 0.5)
-
-        limit_length = half_length + self.object_length_margin
-        limit_width = half_width + self.object_width_margin
-
-        return abs(x_local) <= limit_length and abs(y_local) <= limit_width
+        return is_too_close
 
     @staticmethod
     def _yaw_from_quaternion(x, y, z, w):
