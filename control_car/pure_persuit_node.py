@@ -25,7 +25,6 @@ class HagenRobot:
         self.L = L
         self.Ts = Ts
 
-
 class PurePurSuitController:
     """
     Implements the pure pursuit path tracking controller.
@@ -85,7 +84,6 @@ class PurePurSuitController:
             index += 1
         return index
 
-
 class PurePursuitNode(Node):
     """
     ROS 2 Node for pure pursuit path tracking.
@@ -122,10 +120,10 @@ class PurePursuitNode(Node):
         self.stop_requested = False
         self.object_detections_count = 0
         self.obstacle_stop_requested = False
-        self.obstacle_distance_threshold = 3.0 #1.0
+        self.obstacle_distance_threshold = 2.0 #1.5 
         # Obstacle timeout: clear obstacle flag if no detections arrive within this window
         self.last_detection_time = None
-        self.obstacle_timeout = 1.0  # seconds
+        self.obstacle_timeout = 5.0 #1.0  # seconds
 
         reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -174,10 +172,25 @@ class PurePursuitNode(Node):
             self.kinematic_state_callback,
             best_effort_qos,
         )
+        self.traffic_decision_sub = self.create_subscription(
+            Bool,
+            "/traffic_decision",
+            self.traffic_decision_callback,
+            reliable_qos,
+        )
+
+        # self.traffic_decision_sub = self.create_subscription(
+        #     String,
+        #     "/traffic_decision",
+        #     self.traffic_decision_callback,
+        #     reliable_qos,
+        # )
+        # self.traffic_stop_requested = False
+        # self.traffic_state = "UNKNOWN"
         # Control loop timer
         self.timer = self.create_timer(self.Ts, self.control_loop)
         # Obstacle timeout timer: checks every 0.5s if detections have gone stale
-        #
+        
         self.obstacle_timeout_timer = self.create_timer(0.5, self._check_obstacle_timeout)
         self.get_logger().info("PurePursuitNode started.")
 
@@ -190,8 +203,8 @@ class PurePursuitNode(Node):
         if self.stop_requested:
             self.publish_stop_command()
             self.get_logger().warn(
-                "Stop requested from /allowed_to_move=True. Holding vehicle stopped.",
-                throttle_duration_sec=2.0,
+                "Stop requested from /allowed_to_move. Holding vehicle stopped.",
+                throttle_duration_sec=5.0,
             )
             return
 
@@ -199,7 +212,7 @@ class PurePursuitNode(Node):
             self.publish_stop_command()
             self.get_logger().warn(
                 "Obstacle too close from /objects_in_map_frame. Holding vehicle stopped.",
-                throttle_duration_sec=2.0,
+                throttle_duration_sec=5.0,
             )
             return
 
@@ -211,7 +224,7 @@ class PurePursuitNode(Node):
             self.publish_stop_command()
             self.get_logger().warn(
                 "No valid path available yet. Waiting for /path...",
-                throttle_duration_sec=2.0,
+                throttle_duration_sec=5.0,
             )
             return
 
@@ -219,7 +232,7 @@ class PurePursuitNode(Node):
             self.publish_stop_command()
             self.get_logger().warn(
                 "Waiting for /kinematic_state before sending control commands.",
-                throttle_duration_sec=2.0,
+                throttle_duration_sec=5.0,
             )
             return
 
@@ -231,7 +244,8 @@ class PurePursuitNode(Node):
             if not self.goal_reached:
                 self.goal_reached = True
                 self.get_logger().info(
-                    f"Goal reached. Stopping vehicle at distance {goal_distance:.3f} m from final waypoint."
+                    f"Goal reached. Stopping vehicle at distance {goal_distance:.3f} m from final waypoint.",
+                    throttle_duration_sec = 5.0
                 )
             self.publish_stop_command()
             return
@@ -295,6 +309,39 @@ class PurePursuitNode(Node):
             f"Updated controller path from /path with {pose_count} poses",
              throttle_duration_sec=2.0,
         )
+    
+    def traffic_decision_callback(self, msg: String):
+        """
+        Parses traffic_decision string and stop/resumes based on cmd field.
+        Expected format: cmd=STOP signal=RED sg=1 int=2 lane=3 dist=1.2m ...
+        """
+        new_stop_requested = not bool(msg.data)  # False = stop, True = move
+        if new_stop_requested != self.stop_requested:
+            self.get_logger().info(
+                f"/tarffic_decision_callback={msg.data}. stop_requested={new_stop_requested}"
+            )
+        self.stop_requested = new_stop_requested
+        # data = msg.data
+        # params = {}
+        # for part in data.split():
+        #     if "=" in part:
+        #         k, v = part.split("=", 1)
+        #         params[k] = v.strip('"')
+            
+        #     cmd = params.get("cmd", "UNKNOWN")
+        #     signal = params.get("signal", "-")
+        #     dist = params.get("lane", "-")
+        #     lane = params.get("lane", "-")
+
+        #     new_stop = cmd == "STOP"
+
+        #     if new_stop != self.traffic_stop_requested:
+        #         self.get_logger().info(
+        #             f"Traffic signal changed: cmd={cmd}, signal={signal}, "
+        #             f"lane={lane}, dist={dist}m -> stop_requested={new_stop}"
+        #         )
+        #     self.traffic_stop_requested = new_stop
+        #     self.traffic_signal_state = signal
 
     def kinematic_state_callback(self, msg):
         """
@@ -327,9 +374,9 @@ class PurePursuitNode(Node):
     def allowed_to_move_callback(self, msg):
         """
         Callback for /allowed_to_move topic.
-        Requested behavior: stop vehicle when value is True.
+        Stop vehicle when value is False, allow movement when True.
         """
-        new_stop_requested = bool(msg.data)
+        new_stop_requested = not bool(msg.data)  # False = stop, True = move
         if new_stop_requested != self.stop_requested:
             self.get_logger().info(
                 f"/allowed_to_move={msg.data}. stop_requested={new_stop_requested}"
@@ -403,6 +450,11 @@ class PurePursuitNode(Node):
             )
 
         return is_too_close
+    
+    def publish_obstacle_information(self):
+        info_msg = Bool()
+        info_msg.data = bool(self.obstacle_stop_requested)
+        self.obstacle_information_pub.publish(info_msg)
 
     @staticmethod
     def _yaw_from_quaternion(x, y, z, w):
@@ -414,7 +466,7 @@ class PurePursuitNode(Node):
         drive_msg = AckermannDrive()
         drive_msg.steering_angle = 0.0
         drive_msg.speed = 0.0
-        drive_msg.acceleration = 0.0
+        drive_msg.acceleration = -5.0 #0.0
         try:
             if rclpy.ok():
                 self.ackermann_pub.publish(drive_msg)
@@ -422,12 +474,6 @@ class PurePursuitNode(Node):
             self.get_logger().debug(
                 f"Could not publish stop command during shutdown: {exc}"
             )
-
-    def publish_obstacle_information(self):
-        info_msg = Bool()
-        info_msg.data = bool(self.obstacle_stop_requested)
-        self.obstacle_information_pub.publish(info_msg)
-
 
 def main(args=None):
     """
@@ -444,7 +490,6 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
