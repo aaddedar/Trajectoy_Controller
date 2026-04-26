@@ -27,14 +27,14 @@ Raidhu Beiucy Duraisamy
 The **Pure Pursuit Path Tracking Controller** implements a geometric path tracking algorithm that computes steering commands to make the vehicle follow a reference path while performing real-time obstacle avoidance.
 
 The current implementation is a ROS 2 node named `pure_pursuit_node` that:
-- Subscribes to a **reference path** from the path planner
-- Subscribes to the **kinematic state** (pose and velocity) of the robot
-- Subscribes to **detected obstacles** in the map frame
+- Subscribes to a /path from the path planner
+- Subscribes to the /kinematic_state (pose and velocity) of the robot
+- Subscribes to /objects_in_map_frame for object obstacle and object information
 - Receives **safety signals** (`allowed_to_move`, `traffic_decision`) for emergency stops
 - Computes steering angle using the pure pursuit geometric algorithm with dynamic look-ahead
 - Applies obstacle detection and collision avoidance logic
 - Publishes **Ackermann steering commands** (`steering_angle`, `speed`, `acceleration`)
-- Publishes **obstacle detection status** for downstream safety modules
+- Publishes **obstacle detection status** for downstream modules (HMI)
 - Operates at 100 Hz (10 ms sampling)
 
 ---
