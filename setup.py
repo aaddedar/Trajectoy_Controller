@@ -21,7 +21,8 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'pure_persuit_node = control_car.pure_persuit_node:main',
+            'pure_persuit_node       = control_car.pure_persuit_node:main',
+            'dummy_tracked_objects   = control_car.dummy_tracked_objects:main',
         ],
     },
 )
