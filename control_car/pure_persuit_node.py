@@ -23,7 +23,7 @@ DWA_PREDICT_STEPS = 20       # number of future timesteps to simulate
 DWA_DT            = 0.1      # seconds per step  (matches KF tracker predict_dt)
 DWA_CAR_RADIUS    = 0.45     # m — circle approximation of car footprint (half-diagonal + margin)
 DWA_OBS_MARGIN    = 0.15     # m — extra safety margin added to each obstacle radius
-DWA_SPEEDS        = [1.0, 1.1, 1.2]          # m/s candidates — must be above ESC dead-band (~0.9 m/s)
+DWA_SPEEDS        = [1.0, 1.15, 1.3]         # m/s candidates — must be above ESC dead-band (~0.9 m/s)
 DWA_STEERS        = [-0.5236, -0.35, -0.175, 0.0, 0.175, 0.35, 0.5236]  # rad candidates
 
 
@@ -150,9 +150,9 @@ class PurePursuitNode(Node):
     def __init__(self):
         super().__init__("pure_pursuit_node")
         # Parameters (could be loaded from ROS params)
-        L_d = 0.16   # base look-ahead — e_ss=Ld²/(2R): 0.2m→4cm, 1.0m→58cm on min curve
+        L_d = 0.17   # base look-ahead — e_ss=Ld²/(2R): 0.2m→4cm, 1.0m→58cm on min curve
         k   = 0.05  # small speed scaling keeps LF tight even at high speed
-        self.command_speed = 1.2      # m/s on straight
+        self.command_speed = 1.3      # m/s on straight
         self.min_curve_speed = 1.0   # m/s at tightest curve — ESC dead-band is ~0.9 m/s
         self.Ts = 1.0 / 30.0  # 30 Hz — matches kinematic_state rate, avoids single-thread starvation
         # Goal tolerance aligned with planner (typically 0.10 m),
@@ -778,12 +778,14 @@ class PurePursuitNode(Node):
             vx_p = float(detection.results[0].pose.pose.position.x)
             vy_p = float(detection.results[0].pose.pose.position.y)
 
-            # Person velocity components in car frame
-            v_cx =  vx_p * cos_t + vy_p * sin_t   # forward component (+ve = same dir as car)
-            v_cy = -vx_p * sin_t + vy_p * cos_t   # lateral component (+ve = left of car)
+            # Person velocity components in car frame (same negation as _map_to_car_frame)
+            v_cx = -(vx_p * cos_t + vy_p * sin_t)   # forward component (+ve = same dir as car)
+            v_cy =   vx_p * sin_t - vy_p * cos_t    # lateral component (+ve = left of car)
 
-            # Closing speed: how fast the gap is shrinking
-            closing_speed = self.hagen_robot.v - v_cx
+            # Closing speed: use max(measured, min_curve_speed) so TTC is realistic
+            # even during acceleration phase (measured v lags commanded by 0.5-1.0s).
+            v_eff = max(self.hagen_robot.v, self.min_curve_speed)
+            closing_speed = v_eff - v_cx
             ttc = (cx / closing_speed) if closing_speed > 0.05 else float('inf')
 
             direction = self._person_direction(v_cx, v_cy)
@@ -990,13 +992,18 @@ class PurePursuitNode(Node):
         return (best_v, best_delta)
 
     def _map_to_car_frame(self, x_map: float, y_map: float) -> tuple:
-        """Transform a point from map frame to car frame (base_link)."""
+        """Transform a point from map frame to car frame (base_link).
+
+        theta is MOCAP-inverted: theta=90° means the car is physically heading
+        south (−y), not north.  The actual forward unit vector is (−cos_t, −sin_t),
+        so we negate the standard rotation result.
+        """
         dx = x_map - self.hagen_robot.x
         dy = y_map - self.hagen_robot.y
         cos_t = math.cos(self.hagen_robot.theta)
         sin_t = math.sin(self.hagen_robot.theta)
-        cx =  dx * cos_t + dy * sin_t   # forward (+X in car frame)
-        cy = -dx * sin_t + dy * cos_t   # lateral (+Y = left in car frame)
+        cx = -(dx * cos_t + dy * sin_t)   # forward: +ve = ahead of car
+        cy =   dx * sin_t - dy * cos_t    # lateral: +ve = left of car
         return cx, cy
 
 
