@@ -13,13 +13,17 @@ Subscribes to /kinematic_state so the person is placed relative to the
 car's actual position (works wherever the car starts on the map).
 
 Scenarios (set via 'scenario' ROS parameter):
-  stationary — person 2.5 m directly ahead, not moving   → DWA should stop
-  crossing   — person 3.0 m ahead-right, walks left      → DWA should steer around
-  approaching— person 4.0 m ahead, walks toward car      → DWA should stop or steer
-  zigzag     — person alternates sides every 4 s          → stress-tests DWA replanning
+  stationary  — person 2.0 m ahead, stationary           → TTC=1.5s → hard stop
+  approaching — person 4.0 m ahead, walks toward car      → higher closing speed → stop
+  crossing    — person 3.0 m ahead-right, walks left      → DWA should steer around
+  zigzag      — person alternates sides every 4 s          → stress-tests DWA replanning
+  away        — person 3.0 m ahead, moves same direction  → TTC=inf → no reaction
+  fast_cross  — person 2.0 m ahead, runs fast laterally   → DWA short window avoidance
 
 Usage:
+  ros2 run control_car dummy_tracked_objects --ros-args -p scenario:=stationary
   ros2 run control_car dummy_tracked_objects --ros-args -p scenario:=crossing
+  ros2 run control_car dummy_tracked_objects --ros-args -p scenario:=away
 """
 
 import math
@@ -81,7 +85,7 @@ class DummyTrackedObjects(Node):
 
         self.create_timer(self._dt, self._publish)
 
-        VALID = ['stationary', 'crossing', 'approaching', 'zigzag']
+        VALID = ['stationary', 'approaching', 'crossing', 'zigzag', 'away', 'fast_cross']
         if self._scenario not in VALID:
             self.get_logger().warn(
                 f"Unknown scenario '{self._scenario}'. Valid: {VALID}. "
@@ -103,8 +107,10 @@ class DummyTrackedObjects(Node):
         vx = msg.twist_with_covariance.twist.linear.x
         vy = msg.twist_with_covariance.twist.linear.y
         if math.hypot(vx, vy) > 0.05:
-            # Same 180° MOCAP correction as pure_pursuit
-            self._car_theta = math.atan2(-vy, -vx)
+            # Use actual forward direction so car_to_map places persons correctly.
+            # (pure_pursuit uses backward convention internally, but here we need
+            # forward so that car_to_map(fwd=2.5) puts the person AHEAD of the car.)
+            self._car_theta = math.atan2(vy, vx)
         self._car_known = True
 
     def _init_person(self):
@@ -122,27 +128,45 @@ class DummyTrackedObjects(Node):
         s = self._scenario
 
         if s == 'stationary':
-            self._px, self._py = car_to_map(2.5, 0.0)
+            # 2.0 m ahead, not moving.
+            # At car speed 1.3 m/s: TTC = 2.0/1.3 = 1.54 s ≈ TTC_HARD_STOP (1.5 s) → stop
+            self._px, self._py = car_to_map(2.0, 0.0)
             self._pvx, self._pvy = 0.0, 0.0
 
-        elif s == 'crossing':
-            # Start 1.5 m to the right, walk left at 0.5 m/s (crosses car's path)
-            self._px, self._py = car_to_map(3.0, -1.5)
-            # "left" in map frame = perpendicular CCW from car heading
-            self._pvx = -st * 0.5
-            self._pvy =  ct * 0.5
-
         elif s == 'approaching':
+            # 4.0 m ahead, walking toward car at 0.4 m/s.
+            # Closing speed = 1.3 + 0.4 = 1.7 m/s → TTC = 4.0/1.7 = 2.35 s → DWA avoid
             self._px, self._py = car_to_map(4.0, 0.0)
-            # Walk toward car (opposite of car heading)
-            self._pvx = -ct * 0.4
+            self._pvx = -ct * 0.4   # toward car = opposite of car forward
             self._pvy = -st * 0.4
 
+        elif s == 'crossing':
+            # 3.0 m ahead-right, walks LEFT at 0.5 m/s (crosses car's path).
+            # DWA should steer right to avoid.
+            self._px, self._py = car_to_map(3.0, -1.5)
+            self._pvx = -st * 0.5   # left = 90° CCW from forward
+            self._pvy =  ct * 0.5
+
         elif s == 'zigzag':
-            # Start on right side; direction swaps every 4 s in _publish
+            # Alternates crossing direction every 4 s — stress-tests DWA replanning.
             self._px, self._py = car_to_map(3.0, -0.8)
             self._pvx = -st * 0.4
             self._pvy =  ct * 0.4
+
+        elif s == 'away':
+            # 3.0 m ahead, moving SAME direction as car at 0.6 m/s (faster).
+            # Closing speed = 1.3 - 0.6 = 0.7 m/s → TTC = 3.0/0.7 = 4.3 s > TTC_AVOID
+            # → NO reaction expected (person running away faster than car)
+            self._px, self._py = car_to_map(3.0, 0.0)
+            self._pvx = ct * 0.6    # same direction as car
+            self._pvy = st * 0.6
+
+        elif s == 'fast_cross':
+            # 2.0 m ahead, running fast laterally (1.2 m/s) from right to left.
+            # Short time window for DWA to react before person clears corridor.
+            self._px, self._py = car_to_map(2.0, -0.6)
+            self._pvx = -st * 1.2
+            self._pvy =  ct * 1.2
 
         self._initialized = True
         self.get_logger().info(
@@ -167,16 +191,16 @@ class DummyTrackedObjects(Node):
         self._sim_t += self._dt
 
         # Zigzag: flip lateral direction every 4 s
-        if self._scenario == 'zigzag' and int(self._sim_t / 4.0) % 2 == 1:
+        # ct/st are actual forward direction, so perpendicular left = (-st, ct)
+        if self._scenario == 'zigzag':
             ct = math.cos(self._car_theta)
             st = math.sin(self._car_theta)
-            self._pvx =  st * 0.4
-            self._pvy = -ct * 0.4
-        elif self._scenario == 'zigzag':
-            ct = math.cos(self._car_theta)
-            st = math.sin(self._car_theta)
-            self._pvx = -st * 0.4
-            self._pvy =  ct * 0.4
+            if int(self._sim_t / 4.0) % 2 == 1:
+                self._pvx =  st * 0.4    # right = (st, -ct)
+                self._pvy = -ct * 0.4
+            else:
+                self._pvx = -st * 0.4    # left = (-st, ct)
+                self._pvy =  ct * 0.4
 
         now = self.get_clock().now().to_msg()
         arr = Detection3DArray()

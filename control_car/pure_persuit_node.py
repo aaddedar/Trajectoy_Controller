@@ -15,8 +15,8 @@ from visualization_msgs.msg import Marker
 # Must match Arduino WHEELSTEERLIMIT (0.5235987756 rad = 30°).
 # Arduino clips silently at this value, so commanding more is wasted range.
 STEER_LIMIT   = 0.5236
-TTC_HARD_STOP = 1.5   # seconds — stop if collision is this imminent (at 1.1 m/s → 1.65 m)
-TTC_AVOID     = 3.5   # seconds — steer around person if collision is within this time
+TTC_HARD_STOP = 2.0   # seconds — stop if collision is this imminent (at 1.3 m/s → 2.6 m)
+TTC_AVOID     = 4.0   # seconds — steer around person if collision is within this time
 
 # ── DWA trajectory evaluation parameters ────────────────────────────────
 DWA_PREDICT_STEPS = 20       # number of future timesteps to simulate
@@ -119,16 +119,21 @@ class PurePursuitNode(Node):
 
     def __init__(self):
         super().__init__("pure_pursuit_node")
-        # Parameters (could be loaded from ROS params)
-        L_d = 0.30   # 6 path points ahead at 5cm spacing — smooth yet responsive
+        # Tunable via ROS params (override without recompile):
+        #   ros2 run control_car pure_persuit_node --ros-args -p command_speed:=1.5
+        self.declare_parameter('command_speed',   1.3)
+        self.declare_parameter('min_curve_speed', 1.0)
+        self.declare_parameter('L_d',             0.30)
+        self.declare_parameter('invert_steering', True)
+        L_d = float(self.get_parameter('L_d').value)
         k   = 0.0   # fixed look-ahead, no speed scaling
-        self.command_speed = 1.3      # m/s on straight
-        self.min_curve_speed = 1.0   # m/s at tightest curve — ESC dead-band is ~0.9 m/s
+        self.command_speed   = float(self.get_parameter('command_speed').value)
+        self.min_curve_speed = float(self.get_parameter('min_curve_speed').value)
         self.Ts = 1.0 / 30.0  # 30 Hz — matches kinematic_state rate, avoids single-thread starvation
         # Goal tolerance aligned with planner's _is_current_goal_reached (0.10 m).
         self.goal_tolerance = 0.1
         self.publish_steering_in_degrees = False
-        self.invert_steering_sign = True
+        self.invert_steering_sign = bool(self.get_parameter('invert_steering').value)
         self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.3)
         self.controller = PurePurSuitController(
             self.hagen_robot,
@@ -145,11 +150,11 @@ class PurePursuitNode(Node):
         self.traffic_stop = False
         self.stop_requested = False  # combined: allowed_to_move_stop OR traffic_stop
         self.obstacle_stop_requested = False
-        # Distances derived from TTC thresholds × command_speed (1.1 m/s):
-        #   TTC_HARD_STOP=1.5s → 1.65m,  TTC_AVOID=3.5s → 3.85m
-        self.obstacle_distance_threshold = 4.5   # outer slow-down boundary (m)
-        self.obstacle_avoidance_distance = 3.85  # inside here: steer around obstacle (must match TTC_AVOID * speed)
-        self.obstacle_hard_stop_distance = 1.65  # inside here: hard stop (must match TTC_HARD_STOP * speed)
+        # Distances derived from TTC thresholds × command_speed (1.3 m/s):
+        #   TTC_HARD_STOP=2.0s → 2.6m,  TTC_AVOID=4.0s → 5.2m
+        self.obstacle_distance_threshold = 6.0   # outer slow-down boundary (m)
+        self.obstacle_avoidance_distance = 5.2   # inside here: steer around obstacle (must match TTC_AVOID * speed)
+        self.obstacle_hard_stop_distance = 2.0   # inside here: hard stop — also used as direct safety distance
         self.avoidance_gain = 0.4                # rad of steering per meter of lateral offset
         self.closest_obstacle_distance = float('inf')
         self.closest_obstacle_cy = 0.0           # lateral position of closest obstacle (car frame)
@@ -454,10 +459,10 @@ class PurePursuitNode(Node):
           hard_stop < dist ≤ avoidance_distance : path + lateral nudge AWAY from obstacle
           dist ≤ hard_stop : handled upstream (hard stop), not reached here
 
-        Avoidance nudge:
-          obstacle at cy > 0 (LEFT)  → steer right → subtract from delta
-          obstacle at cy < 0 (RIGHT) → steer left  → add to delta
-          nudge = -avoidance_gain * cy * proximity_factor
+        Avoidance nudge (backward theta: delta<0=left, delta>0=right):
+          obstacle at cy > 0 (LEFT)  → steer right → add positive nudge to delta
+          obstacle at cy < 0 (RIGHT) → steer left  → add negative nudge to delta
+          nudge = +avoidance_gain * cy * proximity_factor
         """
         dist = self.closest_obstacle_distance
         if (dist > self.obstacle_avoidance_distance
@@ -470,7 +475,9 @@ class PurePursuitNode(Node):
             self.obstacle_avoidance_distance - self.obstacle_hard_stop_distance
         )
 
-        nudge = -self.avoidance_gain * self.closest_obstacle_cy * proximity
+        # With backward theta, delta < 0 = left turn, delta > 0 = right turn.
+        # Obstacle LEFT (cy > 0) → steer right → add positive nudge to delta.
+        nudge = self.avoidance_gain * self.closest_obstacle_cy * proximity
         combined = float(np.clip(delta + nudge, -STEER_LIMIT, STEER_LIMIT))
 
         self.get_logger().info(
@@ -629,15 +636,17 @@ class PurePursuitNode(Node):
         map_speed = math.hypot(vx_map, vy_map)
         self.hagen_robot.v = map_speed
 
-        # Heading: MOCAP quaternion with 180° Z correction.
-        # Quaternion gives instantaneous body heading without velocity lag at curves.
-        # The MOCAP frame is 180° rotated around Z vs map frame → add π to yaw.
+        # Heading: MOCAP quaternion, used directly (NO +π correction).
+        # The MOCAP frame is 180° rotated around Z vs the map frame, so when the
+        # car faces east (0° in map), MOCAP reports 180°.  That means
+        # yaw_mocap = actual_heading + π  →  already the backward convention that
+        # _map_to_car_frame, pure_pursuit_control and _simulate_car_trajectory expect.
+        # Adding +π again (as before) gave actual_heading (forward convention), which
+        # made cx negative for objects ahead → obstacle avoidance never triggered.
         q = pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        yaw_mocap = math.atan2(siny, cosy)
-        self.hagen_robot.theta = math.atan2(math.sin(yaw_mocap + math.pi),
-                                            math.cos(yaw_mocap + math.pi))
+        self.hagen_robot.theta = math.atan2(siny, cosy)   # = yaw_mocap = actual + π
 
         self.kinematic_state_received = True
         self.last_kinematic_time = self.get_clock().now()
@@ -728,6 +737,18 @@ class PurePursuitNode(Node):
                     throttle_duration_sec=1.0,
                 )
                 continue
+
+            # ── Safety hard-stop zone: too close to attempt avoidance ──────────
+            if cx < self.obstacle_hard_stop_distance:
+                self.get_logger().warn(
+                    f"[person] SAFETY STOP: cx={cx:.2f}m < {self.obstacle_hard_stop_distance}m "
+                    f"lat={cy:.2f}m — forcing hard stop",
+                    throttle_duration_sec=0.3,
+                )
+                best_ttc = 0.0   # override: force hard stop decision below
+                best_cy  = cy
+                threat_persons.clear()   # skip DWA — hard stop takes priority
+                break                    # no need to check further detections
 
             # KF velocity embedded in results[0].pose.pose.position (map frame)
             vx_p = float(detection.results[0].pose.pose.position.x)
@@ -822,9 +843,13 @@ class PurePursuitNode(Node):
         states = []
         x, y, theta = x0, y0, theta0
         for _ in range(n_steps):
-            x     += v * math.cos(theta) * dt
-            y     += v * math.sin(theta) * dt
-            theta += (v / L) * math.tan(delta) * dt
+            # theta is in the backward convention (actual_heading + π).
+            # Forward: (-cos θ, -sin θ), so negate position update.
+            # Steering: backward theta means delta sign is inverted vs standard,
+            # so negate the heading update too (theta -= instead of +=).
+            x     -= v * math.cos(theta) * dt
+            y     -= v * math.sin(theta) * dt
+            theta -= (v / L) * math.tan(delta) * dt
             states.append((x, y, theta))
         return states
 
