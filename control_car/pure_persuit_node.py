@@ -66,18 +66,9 @@ class PurePurSuitController:
         self.last_index = 0
 
     def pure_pursuit_control(self):
-        """
-        Compute steering angle combining pure pursuit look-ahead with a cross-track
-        error (CTE) correction term.
-
-        Pure pursuit alone recovers from deviations slowly once last_index advances
-        past a corner apex.  The CTE term actively steers back toward the nearest
-        path point so the car does not drift further after going slightly wide.
-        """
+        """Pure pursuit steering — look-ahead only, no CTE correction."""
         target_index = self.look_ahead_point_index()
-        nearest_idx  = self.last_index          # set as side-effect of look_ahead_point_index
 
-        # ── Pure pursuit steering ─────────────────────────────────────────────
         t_x, t_y = self.ref_path_x[target_index], self.ref_path_y[target_index]
         alpha = (
             np.arctan2(t_y - self.hagen_robot.y, t_x - self.hagen_robot.x)
@@ -86,27 +77,6 @@ class PurePurSuitController:
         alpha = np.arctan2(np.sin(alpha), np.cos(alpha))
         LF = self.k * abs(self.hagen_robot.v) + self.L_d
         delta = np.arctan(2 * self.hagen_robot.L * np.sin(alpha) / (LF + 1e-5))
-
-        # ── Cross-track error correction ──────────────────────────────────────
-        # CTE = signed lateral distance from car to nearest path point.
-        # Positive = car is LEFT of path → steer right (subtract from delta).
-        n = len(self.ref_path_x)
-        if nearest_idx + 1 < n:
-            nx, ny = self.ref_path_x[nearest_idx], self.ref_path_y[nearest_idx]
-            tx = self.ref_path_x[nearest_idx + 1] - nx
-            ty = self.ref_path_y[nearest_idx + 1] - ny
-            tlen = np.hypot(tx, ty)
-            if tlen > 1e-6:
-                # Left-normal = rotate tangent 90° CCW
-                ln_x, ln_y = -ty / tlen, tx / tlen
-                cte = ((self.hagen_robot.x - nx) * ln_x
-                       + (self.hagen_robot.y - ny) * ln_y)
-                # Stanley-style correction: atan(k_cte * cte / speed)
-                k_cte = 2.5   # strong recovery — pulls car back within ~2 path steps
-                delta_cte = -np.arctan2(k_cte * cte,
-                                        abs(self.hagen_robot.v) + 0.1)
-                delta += delta_cte
-
         delta = np.clip(delta, -STEER_LIMIT, STEER_LIMIT)
         return delta, target_index
 
@@ -118,10 +88,10 @@ class PurePurSuitController:
         """
         n = len(self.ref_path_x)
         self.last_index = min(self.last_index, n - 1)
-        # Allow a small backward window (15 pts = 0.75 m) so the nearest-point
-        # index doesn't jump past the apex when the car goes slightly wide.
-        # 0.75 m < half U-turn arc (~1.36 m), so this won't snap to the wrong leg.
-        BACK = 15
+        # Allow 30 pts (1.5 m) backward window — covers a full 90° corner arc
+        # (~1.36 m) so the nearest index can snap back to the apex if the car
+        # goes wide, without reaching the wrong leg of a U-turn (~2.7 m arc).
+        BACK = 30
         search_start = max(0, self.last_index - BACK)
         search_x = self.ref_path_x[search_start:]
         search_y = self.ref_path_y[search_start:]
@@ -150,17 +120,16 @@ class PurePursuitNode(Node):
     def __init__(self):
         super().__init__("pure_pursuit_node")
         # Parameters (could be loaded from ROS params)
-        L_d = 0.17   # base look-ahead — e_ss=Ld²/(2R): 0.2m→4cm, 1.0m→58cm on min curve
-        k   = 0.05  # small speed scaling keeps LF tight even at high speed
+        L_d = 0.30   # 6 path points ahead at 5cm spacing — smooth yet responsive
+        k   = 0.0   # fixed look-ahead, no speed scaling
         self.command_speed = 1.3      # m/s on straight
         self.min_curve_speed = 1.0   # m/s at tightest curve — ESC dead-band is ~0.9 m/s
         self.Ts = 1.0 / 30.0  # 30 Hz — matches kinematic_state rate, avoids single-thread starvation
-        # Goal tolerance aligned with planner (typically 0.10 m),
-        # set higher to prevent early stopping and allow planner to advance.
-        self.goal_tolerance = 0.3   # tighter for small model city map
+        # Goal tolerance aligned with planner's _is_current_goal_reached (0.10 m).
+        self.goal_tolerance = 0.1
         self.publish_steering_in_degrees = False
         self.invert_steering_sign = True
-        self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.5)
+        self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.3)
         self.controller = PurePurSuitController(
             self.hagen_robot,
             np.array([], dtype=float),
@@ -622,12 +591,11 @@ class PurePursuitNode(Node):
         # Do NOT clear obstacle state here — obstacle may still be present
         # when path planner replans around it. Obstacle callback will update correctly.
 
-        # Seed heading from first path segment only when stationary.
-        # If the car is already moving, velocity-based theta is more accurate.
-        if pose_count >= 2 and self.hagen_robot.v < 0.05:
-            dx = ref_x[1] - ref_x[0]
-            dy = ref_y[1] - ref_y[0]
-            self.hagen_robot.theta = math.atan2(dy, dx)
+        # Do not seed theta from the path — MOCAP quaternion already provides
+        # accurate heading continuously and uses the backward convention (+π).
+        # Seeding from atan2(dy,dx) here was wrong: it used the forward convention,
+        # contradicting the +π used in kinematic_state_callback and causing an
+        # initial 180° heading error that led to wrong steering at path start.
 
         self.get_logger().info(
             f"Updated controller path from /path with {pose_count} poses (smoothed)",
@@ -661,28 +629,15 @@ class PurePursuitNode(Node):
         map_speed = math.hypot(vx_map, vy_map)
         self.hagen_robot.v = map_speed
 
-        # ── Heading: MOCAP quaternion + 180° Z correction ────────────────────
-        # Velocity-based heading lags during curves (velocity vector trails the
-        # car body angle). MOCAP quaternion gives instantaneous body heading.
+        # Heading: MOCAP quaternion with 180° Z correction.
+        # Quaternion gives instantaneous body heading without velocity lag at curves.
         # The MOCAP frame is 180° rotated around Z vs map frame → add π to yaw.
         q = pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         yaw_mocap = math.atan2(siny, cosy)
-        theta_quat = math.atan2(math.sin(yaw_mocap + math.pi),
-                                math.cos(yaw_mocap + math.pi))
-
-        if map_speed > 0.05:
-            # Blend: 70% quaternion (accurate heading) + 30% velocity (removes
-            # any quaternion drift by anchoring to actual motion direction).
-            vel_theta = math.atan2(-vy_map, -vx_map)
-            # Circular-mean blend (handles wrap-around correctly)
-            dx = 0.7 * math.cos(theta_quat) + 0.3 * math.cos(vel_theta)
-            dy = 0.7 * math.sin(theta_quat) + 0.3 * math.sin(vel_theta)
-            self.hagen_robot.theta = math.atan2(dy, dx)
-        else:
-            # Stationary: quaternion only (no velocity to blend)
-            self.hagen_robot.theta = theta_quat
+        self.hagen_robot.theta = math.atan2(math.sin(yaw_mocap + math.pi),
+                                            math.cos(yaw_mocap + math.pi))
 
         self.kinematic_state_received = True
         self.last_kinematic_time = self.get_clock().now()
