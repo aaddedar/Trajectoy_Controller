@@ -129,13 +129,15 @@ class DummyTrackedObjects(Node):
 
         if s == 'stationary':
             # 2.0 m ahead, not moving.
-            # At car speed 1.3 m/s: TTC = 2.0/1.3 = 1.54 s ≈ TTC_HARD_STOP (1.5 s) → stop
+            # 2.0 < obstacle_hard_stop_distance (2.5m) → safety stop fires immediately ✓
+            # Car should stop as soon as detections start arriving, without needing to move.
             self._px, self._py = car_to_map(2.0, 0.0)
             self._pvx, self._pvy = 0.0, 0.0
 
         elif s == 'approaching':
             # 4.0 m ahead, walking toward car at 0.4 m/s.
-            # Closing speed = 1.3 + 0.4 = 1.7 m/s → TTC = 4.0/1.7 = 2.35 s → DWA avoid
+            # TTC = 4.0 / (1.3+0.4) = 2.35 s > TTC_HARD_STOP=2.0s → DWA first;
+            # as car moves closer TTC drops below 2.0 s → hard stop
             self._px, self._py = car_to_map(4.0, 0.0)
             self._pvx = -ct * 0.4   # toward car = opposite of car forward
             self._pvy = -st * 0.4

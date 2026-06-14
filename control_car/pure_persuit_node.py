@@ -13,38 +13,10 @@ from vision_msgs.msg import Detection3DArray
 from visualization_msgs.msg import Marker
 
 # Must match Arduino WHEELSTEERLIMIT (0.5235987756 rad = 30°).
-# Arduino clips silently at this value, so commanding more is wasted range.
-STEER_LIMIT   = 0.5236
-TTC_HARD_STOP = 2.0   # seconds — stop if collision is this imminent (at 1.3 m/s → 2.6 m)
-TTC_AVOID     = 4.0   # seconds — steer around person if collision is within this time
-
-# ── DWA trajectory evaluation parameters ────────────────────────────────
-DWA_PREDICT_STEPS = 20       # number of future timesteps to simulate
-DWA_DT            = 0.1      # seconds per step  (matches KF tracker predict_dt)
-DWA_CAR_RADIUS    = 0.45     # m — circle approximation of car footprint (half-diagonal + margin)
-DWA_OBS_MARGIN    = 0.15     # m — extra safety margin added to each obstacle radius
-DWA_SPEEDS        = [1.0, 1.15, 1.3]         # m/s candidates — must be above ESC dead-band (~0.9 m/s)
-DWA_STEERS        = [-0.5236, -0.35, -0.175, 0.0, 0.175, 0.35, 0.5236]  # rad candidates
-
-
-class DWAObstacle:
-    """Lightweight container for a tracked obstacle used in DWA collision checking."""
-    __slots__ = ('x', 'y', 'vx', 'vy', 'size_x', 'size_y')
-
-    def __init__(self, x, y, vx, vy, size_x, size_y):
-        self.x      = x
-        self.y      = y
-        self.vx     = vx
-        self.vy     = vy
-        self.size_x = size_x
-        self.size_y = size_y
+STEER_LIMIT = 0.5236
 
 
 class HagenRobot:
-    """
-    Simple robot state container.
-    """
-
     def __init__(self, x=0, y=0, theta=0, v=0, L=0.5):
         self.x = x
         self.y = y
@@ -52,12 +24,9 @@ class HagenRobot:
         self.v = v
         self.L = L
 
-class PurePurSuitController:
-    """
-    Implements the pure pursuit path tracking controller.
-    """
 
-    def __init__(self, robot_model, ref_path_x, ref_path_y, L_d=2.0, k=0.3):
+class PurePurSuitController:
+    def __init__(self, robot_model, ref_path_x, ref_path_y, L_d=0.5, k=0.0):
         self.hagen_robot = robot_model
         self.L_d = L_d
         self.ref_path_x = ref_path_x
@@ -66,10 +35,9 @@ class PurePurSuitController:
         self.last_index = 0
 
     def pure_pursuit_control(self):
-        """Pure pursuit steering — look-ahead only, no CTE correction."""
         target_index = self.look_ahead_point_index()
-
-        t_x, t_y = self.ref_path_x[target_index], self.ref_path_y[target_index]
+        t_x = self.ref_path_x[target_index]
+        t_y = self.ref_path_y[target_index]
         alpha = (
             np.arctan2(t_y - self.hagen_robot.y, t_x - self.hagen_robot.x)
             - self.hagen_robot.theta
@@ -81,95 +49,77 @@ class PurePurSuitController:
         return delta, target_index
 
     def look_ahead_point_index(self):
-        """
-        Find the index of the look-ahead point on the reference path.
-        Returns:
-            index: Index of the look-ahead point
-        """
         n = len(self.ref_path_x)
         self.last_index = min(self.last_index, n - 1)
-        # Allow 30 pts (1.5 m) backward window — covers a full 90° corner arc
-        # (~1.36 m) so the nearest index can snap back to the apex if the car
-        # goes wide, without reaching the wrong leg of a U-turn (~2.7 m arc).
         BACK = 30
         search_start = max(0, self.last_index - BACK)
-        search_x = self.ref_path_x[search_start:]
-        search_y = self.ref_path_y[search_start:]
-        dx = self.hagen_robot.x - search_x
-        dy = self.hagen_robot.y - search_y
-        d = np.sqrt(dx**2 + dy**2)
-        index = search_start + int(np.argmin(d))
-        # Only advance last_index — allow at most BACK pts of retreat
+        dx = self.hagen_robot.x - self.ref_path_x[search_start:]
+        dy = self.hagen_robot.y - self.ref_path_y[search_start:]
+        index = search_start + int(np.argmin(dx**2 + dy**2))
         self.last_index = max(search_start, index)
 
-        L = 0
+        L = 0.0
         LF = self.k * abs(self.hagen_robot.v) + self.L_d
         while LF > L and (index + 1) < n:
             step_x = self.ref_path_x[index + 1] - self.ref_path_x[index]
             step_y = self.ref_path_y[index + 1] - self.ref_path_y[index]
-            L += np.sqrt(step_x**2 + step_y**2)
+            L += math.hypot(step_x, step_y)
             index += 1
         return index
 
+
 class PurePursuitNode(Node):
-    """
-    ROS 2 Node for pure pursuit path tracking.
-    Subscribes to /robot_description, /path, and /kinematic_state, publishes robot state.
-    """
 
     def __init__(self):
         super().__init__("pure_pursuit_node")
-        # Tunable via ROS params (override without recompile):
-        #   ros2 run control_car pure_persuit_node --ros-args -p command_speed:=1.5
-        self.declare_parameter('command_speed',   1.3)
-        self.declare_parameter('min_curve_speed', 1.0)
-        self.declare_parameter('L_d',             0.30)
-        self.declare_parameter('invert_steering', True)
-        L_d = float(self.get_parameter('L_d').value)
-        k   = 0.0   # fixed look-ahead, no speed scaling
-        self.command_speed   = float(self.get_parameter('command_speed').value)
-        self.min_curve_speed = float(self.get_parameter('min_curve_speed').value)
-        self.Ts = 1.0 / 30.0  # 30 Hz — matches kinematic_state rate, avoids single-thread starvation
-        # Goal tolerance aligned with planner's _is_current_goal_reached (0.10 m).
-        self.goal_tolerance = 0.1
-        self.publish_steering_in_degrees = False
+
+        # ── Tunable ROS params ──────────────────────────────────────────────
+        self.declare_parameter('command_speed',         1.4)
+        self.declare_parameter('min_curve_speed',       0.9)
+        self.declare_parameter('L_d',                   0.30)
+        self.declare_parameter('invert_steering',       False)
+        self.declare_parameter('person_stop_dist',      1.0)
+        self.declare_parameter('person_slowdown_dist',  2.5)
+
+        L_d                       = float(self.get_parameter('L_d').value)
+        k                         = 0.0
+        self.command_speed        = float(self.get_parameter('command_speed').value)
+        self.min_curve_speed      = float(self.get_parameter('min_curve_speed').value)
         self.invert_steering_sign = bool(self.get_parameter('invert_steering').value)
+        self.person_stop_dist     = float(self.get_parameter('person_stop_dist').value)
+        self.person_slowdown_dist = float(self.get_parameter('person_slowdown_dist').value)
+
+        self.Ts             = 1.0 / 30.0
+        self.goal_tolerance = 0.1
+
         self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.3)
-        self.controller = PurePurSuitController(
+        self.controller  = PurePurSuitController(
             self.hagen_robot,
             np.array([], dtype=float),
             np.array([], dtype=float),
-            L_d,
-            k,
+            L_d, k,
         )
-        self.path_received = False
-        self.kinematic_state_received = False
-        self.goal_reached = False
-        self._using_velocity_heading = False  # hysteresis flag for theta source
-        self.allowed_to_move_stop = False
-        self.traffic_stop = False
-        self.stop_requested = False  # combined: allowed_to_move_stop OR traffic_stop
-        self.obstacle_stop_requested = False
-        # Distances derived from TTC thresholds × command_speed (1.3 m/s):
-        #   TTC_HARD_STOP=2.0s → 2.6m,  TTC_AVOID=4.0s → 5.2m
-        self.obstacle_distance_threshold = 6.0   # outer slow-down boundary (m)
-        self.obstacle_avoidance_distance = 5.2   # inside here: steer around obstacle (must match TTC_AVOID * speed)
-        self.obstacle_hard_stop_distance = 2.0   # inside here: hard stop — also used as direct safety distance
-        self.avoidance_gain = 0.4                # rad of steering per meter of lateral offset
-        self.closest_obstacle_distance = float('inf')
-        self.closest_obstacle_cy = 0.0           # lateral position of closest obstacle (car frame)
-        self.car_width = 0.40                    # physical car width (m)
-        self.path_corridor_margin = 1.0          # wide corridor — catches persons up to 1.2m off-center
-        # Obstacle timeout: clear obstacle flag if no detections arrive within this window
-        self.last_detection_time = None
-        self.obstacle_timeout = 5.0
-        # Kinematic state staleness: stop if /kinematic_state goes silent
-        self.last_kinematic_time = None
-        self.kinematic_state_timeout = 1.0
-        # DWA: list of DWAObstacle objects, populated from /tracked_objects persons.
-        # Non-empty → control_loop runs DWA trajectory evaluation instead of TTC nudge.
-        self.dwa_obstacles: list = []
 
+        self.path_received            = False
+        self.kinematic_state_received = False
+        self.goal_reached             = False
+        self.allowed_to_move_stop     = False
+        self.stop_requested           = False
+        self.obstacle_stop_requested  = False
+
+        self.closest_person_dist  = float('inf')
+        self.car_width            = 0.40
+        self.path_corridor_margin = 1.0
+
+        self.last_detection_time     = None
+        self.obstacle_timeout        = 5.0
+        self.last_kinematic_time     = None
+        self.kinematic_state_timeout = 3.0
+
+        self.smoothed_speed = 0.0
+        self.smoothed_delta = 0.0
+
+        # ── QoS ─────────────────────────────────────────────────────────────
         reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
@@ -180,71 +130,47 @@ class PurePursuitNode(Node):
             durability=DurabilityPolicy.VOLATILE,
             depth=10,
         )
-        self.ackermann_pub = self.create_publisher(
-            AckermannDrive, "/ackermann_drive", reliable_qos
-        )
-        self.obstacle_information_pub = self.create_publisher(
-            Bool, "/obstacle_information", reliable_qos
-        )
-        self.lookahead_marker_pub = self.create_publisher(
-            Marker, "/pure_pursuit/lookahead_marker", 10
-        )
         latched_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             depth=1,
         )
-        self.path_sub = self.create_subscription(
-            Path, "/path", self.path_callback, latched_qos
+
+        # ── Publishers ───────────────────────────────────────────────────────
+        self.ackermann_pub            = self.create_publisher(AckermannDrive, '/ackermann_drive', reliable_qos)
+        self.obstacle_information_pub = self.create_publisher(Bool, '/obstacle_information', reliable_qos)
+        self.lookahead_marker_pub     = self.create_publisher(Marker, '/pure_pursuit/lookahead_marker', 10)
+
+        # ── Subscribers ──────────────────────────────────────────────────────
+        self.create_subscription(Path,             '/path',                    self.path_callback,                 latched_qos)
+        self.create_subscription(AckermannDrive,   '/ackermann_drive_feedback', self.ackermann_feedback_callback,  best_effort_qos)
+        self.create_subscription(Bool,             '/allowed_to_move',         self.allowed_to_move_callback,      reliable_qos)
+        self.create_subscription(Detection3DArray, '/tracked_objects',         self.objects_in_map_frame_callback, best_effort_qos)
+        self.create_subscription(KinematicState,   '/kinematic_state',         self.kinematic_state_callback,      best_effort_qos)
+
+        self.create_timer(self.Ts, self.control_loop)
+        self.create_timer(0.5,    self._check_obstacle_timeout)
+
+        self.get_logger().info(
+            f"\nPurePursuitNode started.\n"
+            f"  L_d={L_d:.2f}m  speed={self.command_speed:.1f}m/s  "
+            f"min_speed={self.min_curve_speed:.1f}m/s  invert={self.invert_steering_sign}\n"
+            f"  person_stop_dist={self.person_stop_dist:.1f}m  "
+            f"person_slowdown_dist={self.person_slowdown_dist:.1f}m\n"
+            f"  REQUIRED topics for obstacle avoidance:\n"
+            f"    REAL car : camera → detectnet → 3D localizer → KF tracker → /tracked_objects\n"
+            f"    TESTING  : ros2 run control_car dummy_tracked_objects --ros-args -p scenario:=stationary"
         )
-        self.ackermann_feedback_sub = self.create_subscription(
-            AckermannDrive,
-            "/ackermann_drive_feedback",
-            self.ackermann_feedback_callback,
-            best_effort_qos,
-        )
-        self.allowed_to_move_sub = self.create_subscription(
-            Bool,
-            "/allowed_to_move",
-            self.allowed_to_move_callback,
-            reliable_qos,
-        )
-        self.objects_in_map_frame_sub = self.create_subscription(
-            Detection3DArray,
-            "/tracked_objects",
-            self.objects_in_map_frame_callback,
-            reliable_qos,
-        )
-        self.kinematic_state_sub = self.create_subscription(
-            KinematicState,
-            "/kinematic_state",
-            self.kinematic_state_callback,
-            best_effort_qos,
-        )
-        self.traffic_decision_sub = self.create_subscription(
-            Bool,
-            "/traffic_decision",
-            self.traffic_decision_callback,
-            reliable_qos,
-        )
-        # Control loop timer
-        self.timer = self.create_timer(self.Ts, self.control_loop)
-        # Obstacle timeout timer: checks every 0.5s if detections have gone stale
-        
-        self.obstacle_timeout_timer = self.create_timer(0.5, self._check_obstacle_timeout)
-        self.get_logger().info("PurePursuitNode started.")
+
+    # ── Main control loop ─────────────────────────────────────────────────
 
     def control_loop(self):
-        """
-        Main control loop: computes control, updates robot, publishes state.
-        """
         self.publish_obstacle_information()
 
         if self.stop_requested:
             self.publish_stop_command()
             self.get_logger().warn(
-                f"STOPPED: /allowed_to_move={not self.allowed_to_move_stop} "
-                f"traffic_stop={self.traffic_stop}",
+                "STOPPED: /allowed_to_move=False",
                 throttle_duration_sec=2.0,
             )
             return
@@ -252,36 +178,26 @@ class PurePursuitNode(Node):
         if self.obstacle_stop_requested:
             self.publish_stop_command()
             self.get_logger().warn(
-                f"STOPPED: obstacle hard-stop dist={self.closest_obstacle_distance:.2f}m "
-                f"(threshold={self.obstacle_hard_stop_distance}m)",
-                throttle_duration_sec=2.0,
+                f"STOPPED: person at {self.closest_person_dist:.2f}m "
+                f"(hard-stop zone={self.person_stop_dist:.1f}m)",
+                throttle_duration_sec=0.5,
             )
             return
 
-        if (
-            not self.path_received
-            or len(self.controller.ref_path_x) < 2
-            or len(self.controller.ref_path_y) < 2
-        ):
+        if not self.path_received or len(self.controller.ref_path_x) < 2:
             self.publish_stop_command()
-            self.get_logger().warn(
-                "STOPPED: no valid path yet — waiting for /path...",
-                throttle_duration_sec=2.0,
-            )
+            self.get_logger().warn("STOPPED: waiting for /path...", throttle_duration_sec=2.0)
             return
 
         if not self.kinematic_state_received:
             self.publish_stop_command()
-            self.get_logger().warn(
-                "STOPPED: waiting for /kinematic_state...",
-                throttle_duration_sec=2.0,
-            )
+            self.get_logger().warn("STOPPED: waiting for /kinematic_state...", throttle_duration_sec=2.0)
             return
 
-        goal_dx = self.controller.ref_path_x[-1] - self.hagen_robot.x
-        goal_dy = self.controller.ref_path_y[-1] - self.hagen_robot.y
-        goal_distance = float(np.hypot(goal_dx, goal_dy))
-
+        goal_distance = float(np.hypot(
+            self.controller.ref_path_x[-1] - self.hagen_robot.x,
+            self.controller.ref_path_y[-1] - self.hagen_robot.y,
+        ))
         if goal_distance <= self.goal_tolerance:
             if not self.goal_reached:
                 self.goal_reached = True
@@ -289,248 +205,122 @@ class PurePursuitNode(Node):
                 self.controller.ref_path_x = np.array([], dtype=float)
                 self.controller.ref_path_y = np.array([], dtype=float)
                 self.controller.last_index = 0
-                self.closest_obstacle_distance = float('inf')
-                self.closest_obstacle_cy = 0.0
+                self.closest_person_dist = float('inf')
                 self.obstacle_stop_requested = False
-                self.get_logger().info(
-                    f"Goal reached at distance {goal_distance:.3f} m. Path cleared. Steering straight."
-                )
+                self.get_logger().info(f"Goal reached ({goal_distance:.3f}m). Path cleared.")
             self.publish_stop_command()
             return
 
-        delta, target_index = self.controller.pure_pursuit_control()
+        raw_delta, target_index = self.controller.pure_pursuit_control()
+        self.smoothed_delta = 0.5 * self.smoothed_delta + 0.5 * float(raw_delta)
+        delta = self.smoothed_delta
 
-        if self.dwa_obstacles:
-            # ── DWA ACTIVE — log every obstacle before evaluating ────────────
-            obs_lines = []
-            for i, obs in enumerate(self.dwa_obstacles):
-                cx, cy = self._map_to_car_frame(obs.x, obs.y)
-                dist   = math.hypot(cx, cy)
-                spd    = math.hypot(obs.vx, obs.vy)
-                obs_lines.append(
-                    f"  obs[{i}] map=({obs.x:.2f},{obs.y:.2f}) "
-                    f"car=(fwd={cx:.2f}m lat={cy:.2f}m) dist={dist:.2f}m "
-                    f"vel=({obs.vx:.2f},{obs.vy:.2f}) spd={spd:.2f}m/s"
-                )
-            self.get_logger().warn(
-                f"\n{'='*55}\n"
-                f"DWA ACTIVATED — {len(self.dwa_obstacles)} obstacle(s)\n"
-                + "\n".join(obs_lines) + "\n"
-                f"  PP steering: {math.degrees(delta):.1f}deg\n"
-                f"{'='*55}",
-                throttle_duration_sec=0.5,
-            )
-
-            v_dwa, delta_dwa = self._run_dwa(delta)
-
-            if v_dwa == 0.0:
-                self.publish_stop_command()
-                self.get_logger().warn(
-                    f"DWA: *** NO SAFE TRAJECTORY *** — stopping car\n"
-                    f"  {len(self.dwa_obstacles)} obstacle(s) block all {len(DWA_SPEEDS)*len(DWA_STEERS)} candidates",
-                    throttle_duration_sec=1.0,
-                )
-                return
-
-            curve_cap = self._compute_ahead_curvature_speed()
-            cmd_speed = min(v_dwa, curve_cap)
-            delta     = delta_dwa
-            # NOTE: do NOT call pure_pursuit_control() again here — it advances
-            # last_index as a side-effect, which would corrupt path tracking.
-            self.get_logger().warn(
-                f"DWA RESULT: v={v_dwa:.2f}m/s (curve_cap={curve_cap:.2f}) "
-                f"→ cmd={cmd_speed:.2f}m/s  steer={math.degrees(delta_dwa):.1f}deg "
-                f"(PP was {math.degrees(delta):.1f}deg before DWA override)",
-                throttle_duration_sec=0.5,
-            )
+        raw_speed = float(min(
+            self._compute_curve_speed(delta),
+            self._compute_ahead_curvature_speed(),
+            self._compute_safe_speed(),
+        ))
+        # Brake fast, accelerate slowly — keeps path tight on curves
+        if raw_speed < self.smoothed_speed:
+            self.smoothed_speed = raw_speed                               # instant brake
         else:
-            delta     = self._apply_avoidance(delta)
-            cmd_speed = float(min(
-                self._compute_curve_speed(delta),       # reactive: current steering angle
-                self._compute_ahead_curvature_speed(),  # proactive: upcoming path curvature
-                self._compute_safe_speed(),             # obstacle proximity
-            ))
+            self.smoothed_speed = 0.85 * self.smoothed_speed + 0.15 * raw_speed  # slow ramp-up
+        cmd_speed = self.smoothed_speed
 
-        # ── Look-ahead target info ────────────────────────────────────────────
+        # ── Logging ──────────────────────────────────────────────────────────
         px = self.controller.ref_path_x
         py = self.controller.ref_path_y
-        nearest_idx = self.controller.last_index
-        t_x = float(px[target_index]) if len(px) > target_index else float('nan')
-        t_y = float(py[target_index]) if len(py) > target_index else float('nan')
-        n_x = float(px[nearest_idx]) if len(px) > nearest_idx else float('nan')
-        n_y = float(py[nearest_idx]) if len(py) > nearest_idx else float('nan')
-        dist_to_target = math.hypot(t_x - self.hagen_robot.x,
-                                    t_y - self.hagen_robot.y)
+        ni = self.controller.last_index
+        t_x = float(px[target_index]) if target_index < len(px) else float('nan')
+        t_y = float(py[target_index]) if target_index < len(py) else float('nan')
+        n_x = float(px[ni]) if ni < len(px) else float('nan')
+        n_y = float(py[ni]) if ni < len(py) else float('nan')
+
         cte_now = 0.0
-        if nearest_idx + 1 < len(px):
-            tx_seg = px[nearest_idx + 1] - n_x
-            ty_seg = py[nearest_idx + 1] - n_y
+        if ni + 1 < len(px):
+            tx_seg = px[ni + 1] - n_x
+            ty_seg = py[ni + 1] - n_y
             seg_len = math.hypot(tx_seg, ty_seg)
             if seg_len > 1e-6:
-                ln_x, ln_y = -ty_seg / seg_len, tx_seg / seg_len
-                cte_now = ((self.hagen_robot.x - n_x) * ln_x +
-                           (self.hagen_robot.y - n_y) * ln_y)
+                ln_x = -ty_seg / seg_len
+                ln_y =  tx_seg / seg_len
+                cte_now = (self.hagen_robot.x - n_x) * ln_x + (self.hagen_robot.y - n_y) * ln_y
 
+        steering_cmd_deg = math.degrees(-delta if self.invert_steering_sign else delta)
         self.get_logger().info(
-            f"\n"
-            f"  CURRENT : pos=({self.hagen_robot.x:.3f},{self.hagen_robot.y:.3f}) "
-            f"theta={math.degrees(self.hagen_robot.theta):.1f}deg "
-            f"v={self.hagen_robot.v:.2f}m/s\n"
-            f"  NEAREST : path[{nearest_idx}]=({n_x:.3f},{n_y:.3f})  "
-            f"CTE={cte_now:+.3f}m ({'LEFT' if cte_now>0 else 'RIGHT'} of path)\n"
-            f"  LOOKAHEAD: path[{target_index}]=({t_x:.3f},{t_y:.3f})  "
-            f"dist={dist_to_target:.3f}m\n"
-            f"  CMD     : delta={math.degrees(delta):.1f}deg  speed={cmd_speed:.2f}m/s  "
-            f"dwa_obs={len(self.dwa_obstacles)}",
+            f"pos=({self.hagen_robot.x:.2f},{self.hagen_robot.y:.2f}) "
+            f"θ={math.degrees(self.hagen_robot.theta):.0f}° "
+            f"v={self.hagen_robot.v:.2f}m/s | "
+            f"CTE={cte_now:+.3f}m | "
+            f"steer={steering_cmd_deg:+.1f}°({'L' if steering_cmd_deg>0 else 'R'}) "
+            f"spd={cmd_speed:.2f}m/s | "
+            f"person={self.closest_person_dist:.1f}m",
             throttle_duration_sec=0.5,
         )
 
-        # ── RViz marker: look-ahead target (yellow sphere) ───────────────────
+        # ── RViz markers ─────────────────────────────────────────────────────
+        from geometry_msgs.msg import Point
+        stamp = self.get_clock().now().to_msg()
+
         mk = Marker()
-        mk.header.frame_id = 'map'
-        mk.header.stamp    = self.get_clock().now().to_msg()
-        mk.ns     = 'pure_pursuit'
-        mk.id     = 0
-        mk.type   = Marker.SPHERE
-        mk.action = Marker.ADD
-        mk.pose.position.x    = t_x
-        mk.pose.position.y    = t_y
-        mk.pose.position.z    = 0.1
+        mk.header.frame_id = 'map'; mk.header.stamp = stamp
+        mk.ns = 'pure_pursuit'; mk.id = 0; mk.type = Marker.SPHERE; mk.action = Marker.ADD
+        mk.pose.position.x = t_x; mk.pose.position.y = t_y; mk.pose.position.z = 0.1
         mk.pose.orientation.w = 1.0
         mk.scale.x = mk.scale.y = mk.scale.z = 0.15
-        mk.color.r = 1.0; mk.color.g = 1.0; mk.color.b = 0.0; mk.color.a = 1.0
+        mk.color.r = 1.0; mk.color.g = 1.0; mk.color.a = 1.0
         self.lookahead_marker_pub.publish(mk)
 
-        # ── RViz marker: nearest path point (cyan sphere) ────────────────────
         mk2 = Marker()
-        mk2.header = mk.header
-        mk2.ns     = 'pure_pursuit'
-        mk2.id     = 1
-        mk2.type   = Marker.SPHERE
-        mk2.action = Marker.ADD
-        mk2.pose.position.x    = n_x
-        mk2.pose.position.y    = n_y
-        mk2.pose.position.z    = 0.1
+        mk2.header = mk.header; mk2.ns = 'pure_pursuit'; mk2.id = 1
+        mk2.type = Marker.SPHERE; mk2.action = Marker.ADD
+        mk2.pose.position.x = n_x; mk2.pose.position.y = n_y; mk2.pose.position.z = 0.1
         mk2.pose.orientation.w = 1.0
         mk2.scale.x = mk2.scale.y = mk2.scale.z = 0.10
-        mk2.color.r = 0.0; mk2.color.g = 1.0; mk2.color.b = 1.0; mk2.color.a = 1.0
+        mk2.color.g = 1.0; mk2.color.b = 1.0; mk2.color.a = 1.0
         self.lookahead_marker_pub.publish(mk2)
 
-        # ── RViz marker: arrow from car to look-ahead ─────────────────────────
         arrow = Marker()
-        arrow.header = mk.header
-        arrow.ns     = 'pure_pursuit'
-        arrow.id     = 2
-        arrow.type   = Marker.ARROW
-        arrow.action = Marker.ADD
-        from geometry_msgs.msg import Point
-        p_start          = Point()
-        p_start.x        = self.hagen_robot.x
-        p_start.y        = self.hagen_robot.y
-        p_start.z        = 0.1
-        p_end            = Point()
-        p_end.x          = t_x
-        p_end.y          = t_y
-        p_end.z          = 0.1
-        arrow.points     = [p_start, p_end]
-        arrow.scale.x    = 0.04   # shaft diameter
-        arrow.scale.y    = 0.08   # head diameter
-        arrow.scale.z    = 0.10   # head length
-        arrow.color.r    = 1.0; arrow.color.g = 1.0; arrow.color.b = 0.0
-        arrow.color.a    = 1.0
+        arrow.header = mk.header; arrow.ns = 'pure_pursuit'; arrow.id = 2
+        arrow.type = Marker.ARROW; arrow.action = Marker.ADD
+        p0 = Point(); p0.x = self.hagen_robot.x; p0.y = self.hagen_robot.y; p0.z = 0.1
+        p1 = Point(); p1.x = t_x; p1.y = t_y; p1.z = 0.1
+        arrow.points = [p0, p1]
+        arrow.scale.x = 0.04; arrow.scale.y = 0.08; arrow.scale.z = 0.10
+        arrow.color.r = 1.0; arrow.color.g = 1.0; arrow.color.a = 1.0
         self.lookahead_marker_pub.publish(arrow)
 
-        # Publish Ackermann command
+        # ── Publish drive command ─────────────────────────────────────────────
         drive_msg = AckermannDrive()
-        steering_cmd = -delta if self.invert_steering_sign else delta
-        if self.publish_steering_in_degrees:
-            drive_msg.steering_angle = float(np.degrees(steering_cmd))
-        else:
-            drive_msg.steering_angle = float(steering_cmd)
+        drive_msg.steering_angle = float(-delta if self.invert_steering_sign else delta)
         drive_msg.speed = cmd_speed
         self.ackermann_pub.publish(drive_msg)
 
-    def _apply_avoidance(self, delta: float) -> float:
-        """
-        Blend path-following steering with obstacle avoidance steering.
-
-        Zones (by forward distance to closest dynamic obstacle):
-          dist > avoidance_distance : pure path steering, no nudge
-          hard_stop < dist ≤ avoidance_distance : path + lateral nudge AWAY from obstacle
-          dist ≤ hard_stop : handled upstream (hard stop), not reached here
-
-        Avoidance nudge (backward theta: delta<0=left, delta>0=right):
-          obstacle at cy > 0 (LEFT)  → steer right → add positive nudge to delta
-          obstacle at cy < 0 (RIGHT) → steer left  → add negative nudge to delta
-          nudge = +avoidance_gain * cy * proximity_factor
-        """
-        dist = self.closest_obstacle_distance
-        if (dist > self.obstacle_avoidance_distance
-                or dist <= self.obstacle_hard_stop_distance
-                or self.obstacle_stop_requested):
-            return delta
-
-        # Proximity factor: 0.0 at avoidance boundary, 1.0 at hard-stop boundary
-        proximity = 1.0 - (dist - self.obstacle_hard_stop_distance) / (
-            self.obstacle_avoidance_distance - self.obstacle_hard_stop_distance
-        )
-
-        # With backward theta, delta < 0 = left turn, delta > 0 = right turn.
-        # Obstacle LEFT (cy > 0) → steer right → add positive nudge to delta.
-        nudge = self.avoidance_gain * self.closest_obstacle_cy * proximity
-        combined = float(np.clip(delta + nudge, -STEER_LIMIT, STEER_LIMIT))
-
-        self.get_logger().info(
-            f"AVOIDANCE: cy={self.closest_obstacle_cy:.2f}m dist={dist:.2f}m "
-            f"proximity={proximity:.2f} nudge={math.degrees(nudge):.1f}deg "
-            f"delta={math.degrees(delta):.1f}→{math.degrees(combined):.1f}deg",
-            throttle_duration_sec=1.0,
-        )
-        return combined
+    # ── Timeout watchdog ──────────────────────────────────────────────────
 
     def _check_obstacle_timeout(self):
-        """
-        Runs every 0.5 s. Clears stale obstacle state when detections stop arriving.
-        Also resets kinematic_state_received if /kinematic_state goes silent (MOCAP dropout),
-        which causes the control loop to stop the car until state resumes.
-        """
         now = self.get_clock().now()
 
-        # Kinematic state watchdog: stop the car if /kinematic_state goes silent
-        if (self.last_kinematic_time is not None and self.kinematic_state_received):
-            kin_elapsed = (now - self.last_kinematic_time).nanoseconds / 1e9
-            if kin_elapsed > self.kinematic_state_timeout:
-                self.get_logger().warn(
-                    f"No /kinematic_state for {kin_elapsed:.1f}s — stopping.",
-                    throttle_duration_sec=2.0,
-                )
+        if self.last_kinematic_time is not None and self.kinematic_state_received:
+            if (now - self.last_kinematic_time).nanoseconds / 1e9 > self.kinematic_state_timeout:
+                self.get_logger().warn("No /kinematic_state — stopping.", throttle_duration_sec=2.0)
                 self.kinematic_state_received = False
 
         if self.last_detection_time is None:
             return
         elapsed = (now - self.last_detection_time).nanoseconds / 1e9
         if elapsed > self.obstacle_timeout and (
-            self.obstacle_stop_requested
-            or self.closest_obstacle_distance < float('inf')
-            or self.dwa_obstacles
+            self.obstacle_stop_requested or self.closest_person_dist < float('inf')
         ):
-            self.get_logger().info(
-                f"No detections for {elapsed:.1f}s — clearing obstacle state, resuming."
-            )
+            self.get_logger().info(f"No detections for {elapsed:.1f}s — clearing, resuming.")
             self.obstacle_stop_requested = False
-            self.closest_obstacle_distance = float('inf')
-            self.closest_obstacle_cy = 0.0
-            self.dwa_obstacles = []
+            self.closest_person_dist     = float('inf')
             self.publish_obstacle_information()
 
+    # ── Path processing ───────────────────────────────────────────────────
+
     @staticmethod
-    def _smooth_path(x: np.ndarray, y: np.ndarray,
-                     window: int = 7, iterations: int = 3) -> tuple:
-        """
-        Iterative moving-average smoothing — rounds off sharp A* grid corners.
-        Uses edge-replication padding so boundary points are not pulled toward (0,0)
-        as they would be with the default zero-padding in np.convolve mode='same'.
-        """
+    def _smooth_path(x, y, window=7, iterations=3):
         pad = window // 2
         kernel = np.ones(window) / window
         for _ in range(iterations):
@@ -539,491 +329,185 @@ class PurePursuitNode(Node):
         return x, y
 
     @staticmethod
-    def _densify_path(x: np.ndarray, y: np.ndarray, spacing: float = 0.05) -> tuple:
-        """
-        Resample path at uniform arc-length spacing (default 5 cm).
-
-        A* step_size_cells=34 × 7.69 mm ≈ 0.26 m per waypoint.
-        With L_d=0.1 m the while-loop look-ahead exits after a single step, giving
-        zero curve anticipation.  Densifying to 5 cm gives 4–5 points of preview
-        so the controller can actually see the upcoming curve direction.
-        """
+    def _densify_path(x, y, spacing=0.05):
         if len(x) < 2:
             return x, y
-        dx = np.diff(x)
-        dy = np.diff(y)
-        seg_len = np.sqrt(dx**2 + dy**2)
+        seg_len = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
         s = np.concatenate([[0.0], np.cumsum(seg_len)])
-        total = s[-1]
-        if total < spacing:
+        if s[-1] < spacing:
             return x, y
-        s_new = np.arange(0.0, total, spacing)
-        x_new = np.interp(s_new, s, x)
-        y_new = np.interp(s_new, s, y)
-        # Always include the exact goal endpoint
-        x_new = np.append(x_new, x[-1])
-        y_new = np.append(y_new, y[-1])
+        s_new = np.arange(0.0, s[-1], spacing)
+        x_new = np.append(np.interp(s_new, s, x), x[-1])
+        y_new = np.append(np.interp(s_new, s, y), y[-1])
         return x_new, y_new
 
     def path_callback(self, msg):
-        """
-        Callback for /path topic.
-        """
-        pose_count = len(msg.poses)
-        if pose_count < 2:
-            self.get_logger().warn(
-                f"Received /path with {pose_count} pose(s). Need at least 2 poses."
-            )
+        if len(msg.poses) < 2:
+            self.get_logger().warn(f"Received /path with {len(msg.poses)} poses — need ≥ 2.")
             return
 
-        ref_x = np.array([pose.pose.position.x for pose in msg.poses], dtype=float)
-        ref_y = np.array([pose.pose.position.y for pose in msg.poses], dtype=float)
-
-        # 1. Smooth: round off sharp A* staircase corners into arcs.
-        # 2. Densify: resample to 5 cm spacing so the look-ahead has fine resolution.
-        #    Without densification, LF (0.21 m) < step size (0.26 m) → the while-loop
-        #    always exits after 1 step → zero curve anticipation → car goes wide.
+        ref_x = np.array([p.pose.position.x for p in msg.poses], dtype=float)
+        ref_y = np.array([p.pose.position.y for p in msg.poses], dtype=float)
         start_x, start_y = ref_x[0], ref_y[0]
         end_x,   end_y   = ref_x[-1], ref_y[-1]
+
         ref_x, ref_y = self._smooth_path(ref_x, ref_y)
         ref_x, ref_y = self._densify_path(ref_x, ref_y, spacing=0.05)
-        ref_x[0],  ref_y[0]  = start_x, start_y
+        ref_x[0], ref_y[0]   = start_x, start_y
         ref_x[-1], ref_y[-1] = end_x,   end_y
 
         self.controller.ref_path_x = ref_x
         self.controller.ref_path_y = ref_y
         self.controller.last_index = 0
         self.path_received = True
-        self.goal_reached = False
-        # Do NOT clear obstacle state here — obstacle may still be present
-        # when path planner replans around it. Obstacle callback will update correctly.
+        self.goal_reached  = False
+        self.get_logger().info(f"Path received: {len(msg.poses)} poses → {len(ref_x)} pts after smooth+densify")
 
-        # Do not seed theta from the path — MOCAP quaternion already provides
-        # accurate heading continuously and uses the backward convention (+π).
-        # Seeding from atan2(dy,dx) here was wrong: it used the forward convention,
-        # contradicting the +π used in kinematic_state_callback and causing an
-        # initial 180° heading error that led to wrong steering at path start.
-
-        self.get_logger().info(
-            f"Updated controller path from /path with {pose_count} poses (smoothed)",
-             throttle_duration_sec=2.0,
-        )
-    
-    def traffic_decision_callback(self, msg: Bool):
-        """
-        Stop when traffic_decision is False (red), move when True (green).
-        """
-        self.traffic_stop = not bool(msg.data)
-        self.stop_requested = self.allowed_to_move_stop or self.traffic_stop
-        self.get_logger().info(
-            f"/traffic_decision={msg.data} traffic_stop={self.traffic_stop} "
-            f"stop_requested={self.stop_requested}"
-        )
+    # ── Callbacks ─────────────────────────────────────────────────────────
 
     def kinematic_state_callback(self, msg):
-        """
-        Callback for /kinematic_state topic. Updates robot pose from message.
-        Heading is derived from map-frame velocity so it is correct regardless of
-        MOCAP quaternion convention. Falls back to MOCAP yaw when stationary.
-        """
         pose = msg.pose_with_covariance.pose
         self.hagen_robot.x = pose.position.x
         self.hagen_robot.y = pose.position.y
 
-        # Map-frame velocity
-        vx_map = msg.twist_with_covariance.twist.linear.x
-        vy_map = msg.twist_with_covariance.twist.linear.y
-        map_speed = math.hypot(vx_map, vy_map)
-        self.hagen_robot.v = map_speed
+        vx = msg.twist_with_covariance.twist.linear.x
+        vy = msg.twist_with_covariance.twist.linear.y
+        self.hagen_robot.v = math.hypot(vx, vy)
 
-        # Heading: MOCAP quaternion, used directly (NO +π correction).
-        # The MOCAP frame is 180° rotated around Z vs the map frame, so when the
-        # car faces east (0° in map), MOCAP reports 180°.  That means
-        # yaw_mocap = actual_heading + π  →  already the backward convention that
-        # _map_to_car_frame, pure_pursuit_control and _simulate_car_trajectory expect.
-        # Adding +π again (as before) gave actual_heading (forward convention), which
-        # made cx negative for objects ahead → obstacle avoidance never triggered.
         q = pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.hagen_robot.theta = math.atan2(siny, cosy)   # = yaw_mocap = actual + π
+        self.hagen_robot.theta = math.atan2(siny, cosy)
 
         self.kinematic_state_received = True
         self.last_kinematic_time = self.get_clock().now()
         self.get_logger().info(
             f"kin: pos=({self.hagen_robot.x:.3f},{self.hagen_robot.y:.3f}) "
-            f"theta={math.degrees(self.hagen_robot.theta):.1f}deg "
-            f"v={map_speed:.3f}m/s vel_heading={self._using_velocity_heading}",
+            f"θ={math.degrees(self.hagen_robot.theta):.1f}° v={self.hagen_robot.v:.3f}m/s",
             throttle_duration_sec=1.0,
         )
 
     def ackermann_feedback_callback(self, msg):
-        self.get_logger().debug(
-            f"Ackermann feedback: speed={msg.speed:.3f}, steering={msg.steering_angle:.3f}"
-        )
+        self.get_logger().debug(f"feedback: spd={msg.speed:.3f} steer={msg.steering_angle:.3f}")
 
     def allowed_to_move_callback(self, msg):
-        """
-        Stop vehicle when /allowed_to_move is False, allow movement when True.
-        """
         self.allowed_to_move_stop = not bool(msg.data)
-        self.stop_requested = self.allowed_to_move_stop or self.traffic_stop
-        self.get_logger().info(
-            f"/allowed_to_move={msg.data} allowed_stop={self.allowed_to_move_stop} "
-            f"stop_requested={self.stop_requested}"
-        )
+        self.stop_requested = self.allowed_to_move_stop
+        self.get_logger().info(f"/allowed_to_move={msg.data}  stop={self.stop_requested}")
+
+    @staticmethod
+    def _is_person(class_id: str) -> bool:
+        s = class_id.strip().lower()
+        return s == 'person' or s == '1'
 
     def objects_in_map_frame_callback(self, msg):
-        """
-        Callback for /tracked_objects (KF tracker output).
-        Only reacts to 'person' class. All other objects are static and handled by the path planner.
-        Uses Time-To-Collision (TTC) to decide: stop vs steer around vs ignore.
-        """
         self.last_detection_time = self.get_clock().now()
 
-        # Log every object so we can trace exactly where in the pipeline detections are lost.
-        # Shows class + map-frame position for each tracked object.
-        if msg.detections:
-            obj_summary = " | ".join(
-                f"{d.results[0].hypothesis.class_id if d.results else '?'}"
-                f"@({d.bbox.center.position.x:.1f},{d.bbox.center.position.y:.1f})"
-                for d in msg.detections
-            )
-            self.get_logger().warn(
-                f"[tracked] {len(msg.detections)} obj(s): {obj_summary}",
-                throttle_duration_sec=1.0,
-            )
-        else:
-            self.get_logger().info(
-                "[tracked] 0 objects — clear",
-                throttle_duration_sec=2.0,
-            )
-
-        if not self.kinematic_state_received:
-            self.closest_obstacle_distance = float('inf')
-            self.obstacle_stop_requested = False
+        if not msg.detections:
+            self.get_logger().info("[tracked] 0 objects — clear", throttle_duration_sec=2.0)
+            self._clear_obstacle()
             return
 
-        best_ttc = float('inf')
-        best_cy  = 0.0
+        if not self.kinematic_state_received:
+            self.get_logger().warn("[tracked] no kinematic state yet — skipping", throttle_duration_sec=2.0)
+            return
 
-        cos_t = math.cos(self.hagen_robot.theta)
-        sin_t = math.sin(self.hagen_robot.theta)
-
-        # Persons that passed both the ahead-check and corridor-check.
-        # DWA uses this same set — avoids acting on persons already cleared by TTC.
         corridor_half = self.car_width / 2.0 + self.path_corridor_margin
-        threat_persons: list = []
+        closest_cx = float('inf')
 
-        for detection in msg.detections:
-            if not detection.results:
+        for det in msg.detections:
+            if not det.results:
                 continue
-            class_name = detection.results[0].hypothesis.class_id.lower()
-            if class_name != "person":
-                continue  # static objects handled by path planner, ignore here
+            cid = det.results[0].hypothesis.class_id
+            if not self._is_person(cid):
+                self.get_logger().info(
+                    f"[tracked] skipping class='{cid}'", throttle_duration_sec=2.0)
+                continue
 
-            # Position in map frame (bounding box center)
-            x_map = float(detection.bbox.center.position.x)
-            y_map = float(detection.bbox.center.position.y)
+            x_map = float(det.bbox.center.position.x)
+            y_map = float(det.bbox.center.position.y)
             cx, cy = self._map_to_car_frame(x_map, y_map)
 
+            self.get_logger().warn(
+                f"[PERSON] class='{cid}' map=({x_map:.2f},{y_map:.2f}) "
+                f"→ car fwd={cx:.2f}m lat={cy:.2f}m corridor_half={corridor_half:.2f}m",
+                throttle_duration_sec=0.3,
+            )
+
             if cx <= 0.1:
-                continue  # person is behind or at car — ignore
-
-            # Corridor check: ignore person far to the side (not in car's path)
-            if abs(cy) > corridor_half:
-                self.get_logger().warn(
-                    f"[person] outside corridor cy={cy:.2f}m half={corridor_half:.2f}m — ignored",
-                    throttle_duration_sec=1.0,
-                )
+                self.get_logger().info(f"[person] behind car (cx={cx:.2f}) — skip", throttle_duration_sec=1.0)
                 continue
+            if abs(cy) > corridor_half:
+                self.get_logger().info(
+                    f"[person] outside corridor (|cy|={abs(cy):.2f} > {corridor_half:.2f}) — skip",
+                    throttle_duration_sec=1.0)
+                continue
+            if cx < closest_cx:
+                closest_cx = cx
 
-            # ── Safety hard-stop zone: too close to attempt avoidance ──────────
-            if cx < self.obstacle_hard_stop_distance:
-                self.get_logger().warn(
-                    f"[person] SAFETY STOP: cx={cx:.2f}m < {self.obstacle_hard_stop_distance}m "
-                    f"lat={cy:.2f}m — forcing hard stop",
-                    throttle_duration_sec=0.3,
-                )
-                best_ttc = 0.0   # override: force hard stop decision below
-                best_cy  = cy
-                threat_persons.clear()   # skip DWA — hard stop takes priority
-                break                    # no need to check further detections
+        if closest_cx == float('inf'):
+            self.get_logger().info("[person] none in corridor ahead — clear", throttle_duration_sec=2.0)
+            self._clear_obstacle()
+            return
 
-            # KF velocity embedded in results[0].pose.pose.position (map frame)
-            vx_p = float(detection.results[0].pose.pose.position.x)
-            vy_p = float(detection.results[0].pose.pose.position.y)
+        self.closest_person_dist = closest_cx
 
-            # Person velocity components in car frame (same negation as _map_to_car_frame)
-            v_cx = -(vx_p * cos_t + vy_p * sin_t)   # forward component (+ve = same dir as car)
-            v_cy =   vx_p * sin_t - vy_p * cos_t    # lateral component (+ve = left of car)
-
-            # Closing speed: use max(measured, min_curve_speed) so TTC is realistic
-            # even during acceleration phase (measured v lags commanded by 0.5-1.0s).
-            v_eff = max(self.hagen_robot.v, self.min_curve_speed)
-            closing_speed = v_eff - v_cx
-            ttc = (cx / closing_speed) if closing_speed > 0.05 else float('inf')
-
-            direction = self._person_direction(v_cx, v_cy)
+        if closest_cx < self.person_stop_dist:
+            self.obstacle_stop_requested = True
             self.get_logger().warn(
-                f"[person] fwd={cx:.2f}m lat={cy:.2f}m "
-                f"v_fwd={v_cx:.2f} v_lat={v_cy:.2f} "
-                f"closing={closing_speed:.2f}m/s TTC={ttc:.1f}s dir={direction}",
-                throttle_duration_sec=0.5,
+                f"PERSON HARD STOP: {closest_cx:.2f}m < stop_dist={self.person_stop_dist:.1f}m",
+                throttle_duration_sec=0.3,
             )
-
-            if ttc < best_ttc:
-                best_ttc = ttc
-                best_cy  = cy
-
-            # Collect for DWA — same gate as TTC (ahead + in corridor)
-            threat_persons.append(detection)
-
-        # ── Decision ──────────────────────────────────────────────────────────
-        if best_ttc == float('inf'):
-            # No person on collision course → clear everything including DWA
-            if self.obstacle_stop_requested or self.closest_obstacle_distance < float('inf'):
-                self.get_logger().info("Person cleared — resuming normal drive")
-            self.obstacle_stop_requested    = False
-            self.closest_obstacle_distance  = float('inf')
-            self.closest_obstacle_cy        = 0.0
-            self.dwa_obstacles              = []   # clear so DWA doesn't run on stale data
-
-        elif best_ttc < TTC_HARD_STOP:
-            # Too close to steer around — STOP
-            self.obstacle_stop_requested    = True
-            self.closest_obstacle_distance  = 0.0
-            self.closest_obstacle_cy        = best_cy
-            self.dwa_obstacles              = []   # hard-stop takes over; DWA not needed
-            self.get_logger().warn(
-                f"HARD STOP: TTC={best_ttc:.1f}s < {TTC_HARD_STOP}s — collision imminent",
-                throttle_duration_sec=0.5,
-            )
-
         else:
-            # TTC manageable — steer around person via DWA
-            virtual_dist = best_ttc * self.hagen_robot.v
-            self.obstacle_stop_requested   = False
-            self.closest_obstacle_distance = virtual_dist
-            self.closest_obstacle_cy       = best_cy
-            # Populate DWA with only the qualified (ahead + corridor) persons
-            self.dwa_obstacles = [
-                DWAObstacle(
-                    x=float(det.bbox.center.position.x),
-                    y=float(det.bbox.center.position.y),
-                    vx=float(det.results[0].pose.pose.position.x),
-                    vy=float(det.results[0].pose.pose.position.y),
-                    size_x=float(det.bbox.size.x) if det.bbox.size.x > 0 else 0.5,
-                    size_y=float(det.bbox.size.y) if det.bbox.size.y > 0 else 0.5,
-                )
-                for det in threat_persons
-            ]
+            self.obstacle_stop_requested = False
+            self.get_logger().warn(
+                f"[person] slowdown zone: {closest_cx:.2f}m",
+                throttle_duration_sec=1.0,
+            )
 
         self.publish_obstacle_information()
 
-    @staticmethod
-    def _person_direction(v_cx: float, v_cy: float) -> str:
-        """Person movement direction relative to the car's heading."""
-        speed = math.hypot(v_cx, v_cy)
-        if speed < 0.1:
-            return "stationary"
-        if abs(v_cx) >= abs(v_cy):
-            return "toward_car" if v_cx < 0 else "away_from_car"
-        return "left" if v_cy > 0 else "right"
+    def _clear_obstacle(self):
+        if self.obstacle_stop_requested or self.closest_person_dist < float('inf'):
+            self.get_logger().info("Person cleared — resuming.")
+        self.obstacle_stop_requested = False
+        self.closest_person_dist     = float('inf')
+        self.publish_obstacle_information()
 
-    # ── DWA: Dynamic Window Approach ─────────────────────────────────────────
+    # ── Car-frame transform ───────────────────────────────────────────────
 
-    @staticmethod
-    def _simulate_car_trajectory(x0, y0, theta0, v, delta, L,
-                                 n_steps=DWA_PREDICT_STEPS, dt=DWA_DT):
-        """
-        Integrate the bicycle kinematic model for n_steps × dt seconds.
-        Returns list of (x, y, theta) — one entry per future timestep.
-        """
-        states = []
-        x, y, theta = x0, y0, theta0
-        for _ in range(n_steps):
-            # theta is in the backward convention (actual_heading + π).
-            # Forward: (-cos θ, -sin θ), so negate position update.
-            # Steering: backward theta means delta sign is inverted vs standard,
-            # so negate the heading update too (theta -= instead of +=).
-            x     -= v * math.cos(theta) * dt
-            y     -= v * math.sin(theta) * dt
-            theta -= (v / L) * math.tan(delta) * dt
-            states.append((x, y, theta))
-        return states
-
-    def _cte_to_path(self, x: float, y: float) -> float:
-        """
-        Signed lateral distance from (x, y) to the nearest reference path segment.
-        Positive = point is LEFT of path direction.
-        Returns 0 if path is not available.
-        """
-        px = self.controller.ref_path_x
-        py = self.controller.ref_path_y
-        if len(px) < 2:
-            return 0.0
-        dx  = x - px
-        dy  = y - py
-        idx = int(np.argmin(dx ** 2 + dy ** 2))
-        if idx + 1 >= len(px):
-            idx = len(px) - 2
-        tx   = px[idx + 1] - px[idx]
-        ty   = py[idx + 1] - py[idx]
-        tlen = math.hypot(tx, ty)
-        if tlen < 1e-6:
-            return 0.0
-        # Left-normal of path segment
-        ln_x, ln_y = -ty / tlen, tx / tlen
-        return float((x - px[idx]) * ln_x + (y - py[idx]) * ln_y)
-
-    def _run_dwa(self, pp_delta: float) -> tuple:
-        """
-        Dynamic Window Approach obstacle avoidance.
-
-        Evaluates all (speed, steering) candidate trajectories against
-        constant-velocity projections of every obstacle in self.dwa_obstacles.
-        Collision detection uses circle approximations for speed.
-
-        Returns (v_cmd, delta_cmd) for the best collision-free trajectory,
-        or (0.0, 0.0) if every moving trajectory collides (car should stop).
-
-        Strategy:
-          1. Always try the pure-pursuit trajectory first (cheapest path).
-          2. If PP is safe, use it — no unnecessary avoidance manoeuvre.
-          3. Otherwise search all (speed × steering) candidates, rank by:
-               cost = 2.0 × |CTE at end| + 0.5 × |delta - pp_delta| + 1.0 × (v_max - v)
-             → prefers staying on path, minimises steering change, maximises speed.
-        """
-        x0  = self.hagen_robot.x
-        y0  = self.hagen_robot.y
-        th0 = self.hagen_robot.theta
-        L   = self.hagen_robot.L
-
-        # Pre-project every obstacle forward at constant velocity
-        obs_futures = []
-        for obs in self.dwa_obstacles:
-            r_obs = max(obs.size_x, obs.size_y) / 2.0 + DWA_OBS_MARGIN
-            future = [
-                (obs.x + obs.vx * (k + 1) * DWA_DT,
-                 obs.y + obs.vy * (k + 1) * DWA_DT)
-                for k in range(DWA_PREDICT_STEPS)
-            ]
-            obs_futures.append((future, r_obs))
-
-        def collides(states):
-            for k, (cx, cy, _) in enumerate(states):
-                for fut, r_obs in obs_futures:
-                    ox, oy = fut[k]
-                    if math.hypot(cx - ox, cy - oy) < (DWA_CAR_RADIUS + r_obs):
-                        return True
-            return False
-
-        # Step 1: check whether pure-pursuit trajectory is already safe
-        pp_speed  = self._compute_curve_speed(pp_delta)
-        pp_states = self._simulate_car_trajectory(x0, y0, th0, pp_speed, pp_delta, L)
-        if not collides(pp_states):
-            self.get_logger().info(
-                f"DWA: PP trajectory safe (v={pp_speed:.2f} delta={math.degrees(pp_delta):.1f}deg) — no avoidance",
-                throttle_duration_sec=1.0,
-            )
-            return (pp_speed, pp_delta)
-
-        self.get_logger().warn(
-            f"DWA: PP trajectory COLLIDES — searching {len(DWA_SPEEDS)*len(DWA_STEERS)} candidates ...",
-            throttle_duration_sec=0.5,
-        )
-
-        # Step 2: search all candidates for the lowest-cost safe trajectory
-        best_v, best_delta, best_cost = None, None, float('inf')
-        safe_count = 0
-
-        for v in DWA_SPEEDS:
-            for delta in DWA_STEERS:
-                states = self._simulate_car_trajectory(x0, y0, th0, v, delta, L)
-                if collides(states):
-                    continue
-                safe_count += 1
-                end_x, end_y, _ = states[-1]
-                cte  = abs(self._cte_to_path(end_x, end_y))
-                cost = (2.0 * cte
-                        + 0.5 * abs(delta - pp_delta)
-                        + 1.0 * (self.command_speed - v))
-                if cost < best_cost:
-                    best_cost  = cost
-                    best_v     = v
-                    best_delta = delta
-
-        if best_v is None:
-            self.get_logger().warn(
-                "DWA: 0 safe candidates found — all trajectories collide",
-                throttle_duration_sec=0.5,
-            )
-            return (0.0, 0.0)
-
-        best_end = self._simulate_car_trajectory(x0, y0, th0, best_v, best_delta, L)[-1]
-        best_cte = abs(self._cte_to_path(best_end[0], best_end[1]))
-        self.get_logger().warn(
-            f"DWA: {safe_count}/{len(DWA_SPEEDS)*len(DWA_STEERS)} safe  "
-            f"→ best v={best_v:.2f}m/s steer={math.degrees(best_delta):.1f}deg "
-            f"cost={best_cost:.2f} cte={best_cte:.2f}m",
-            throttle_duration_sec=0.5,
-        )
-        return (best_v, best_delta)
-
-    def _map_to_car_frame(self, x_map: float, y_map: float) -> tuple:
-        """Transform a point from map frame to car frame (base_link).
-
-        theta is MOCAP-inverted: theta=90° means the car is physically heading
-        south (−y), not north.  The actual forward unit vector is (−cos_t, −sin_t),
-        so we negate the standard rotation result.
-        """
+    def _map_to_car_frame(self, x_map, y_map):
         dx = x_map - self.hagen_robot.x
         dy = y_map - self.hagen_robot.y
         cos_t = math.cos(self.hagen_robot.theta)
         sin_t = math.sin(self.hagen_robot.theta)
-        cx = -(dx * cos_t + dy * sin_t)   # forward: +ve = ahead of car
-        cy =   dx * sin_t - dy * cos_t    # lateral: +ve = left of car
+        cx =  dx * cos_t + dy * sin_t
+        cy = -dx * sin_t + dy * cos_t
         return cx, cy
 
+    # ── Speed scaling ─────────────────────────────────────────────────────
 
-    def _compute_curve_speed(self, delta: float) -> float:
-        """
-        Scale speed with CURRENT steering angle (reactive).
-          delta = 0.00 rad       → command_speed
-          delta = STEER_LIMIT rad → min_curve_speed
-        """
-        ratio = min(1.0, abs(delta) / STEER_LIMIT)
+    def _compute_curve_speed(self, delta):
+        # sqrt mapping: speed drops steeply even at small steer angles
+        ratio = min(1.0, abs(delta) / STEER_LIMIT) ** 0.5
         return self.command_speed - (self.command_speed - self.min_curve_speed) * ratio
 
-    def _compute_ahead_curvature_speed(self) -> float:
-        """
-        Proactive speed reduction: look 1.5 m ahead on the reference path
-        and find the tightest curve coming up. Slow down BEFORE entering it,
-        not after the car is already going wide.
-
-        Car minimum turning radius = L / tan(STEER_LIMIT) = 0.5 / 0.577 = 0.866 m
-        Curvature k = 1/R.  k_max = 1/0.866 = 1.154 rad/m.
-        At k_max → min_curve_speed.  At k=0 → command_speed.
-        """
+    def _compute_ahead_curvature_speed(self):
         px = self.controller.ref_path_x
         py = self.controller.ref_path_y
         n  = len(px)
         if n < 3:
             return self.command_speed
 
-        idx   = self.controller.last_index
-        R_min = self.hagen_robot.L / math.tan(STEER_LIMIT)   # 0.866 m
-        k_max = 1.0 / R_min                                   # 1.154 rad/m
-
-        LOOK_STEPS = 60   # 60 × 5 cm = 3.0 m ahead — slow down earlier before curve entry
-
+        idx     = self.controller.last_index
+        R_min   = self.hagen_robot.L / math.tan(STEER_LIMIT)
+        k_max   = 1.0 / R_min
         worst_k = 0.0
-        for i in range(idx, min(idx + LOOK_STEPS, n - 2)):
-            p1x, p1y = px[i],   py[i]
-            p2x, p2y = px[i+1], py[i+1]
-            p3x, p3y = px[min(i+2, n-1)], py[min(i+2, n-1)]
-            # Menger curvature = 4 × triangle_area / (d12 × d23 × d13)
+
+        for i in range(idx, min(idx + 30, n - 2)):
+            p1x, p1y = px[i],            py[i]
+            p2x, p2y = px[i+1],          py[i+1]
+            p3x, p3y = px[min(i+2,n-1)], py[min(i+2,n-1)]
             area = abs((p2x-p1x)*(p3y-p1y) - (p3x-p1x)*(p2y-p1y)) / 2.0
             d12  = math.hypot(p2x-p1x, p2y-p1y)
             d23  = math.hypot(p3x-p2x, p3y-p2y)
@@ -1031,34 +515,28 @@ class PurePursuitNode(Node):
             if d12 * d23 * d13 > 1e-10:
                 worst_k = max(worst_k, 4.0 * area / (d12 * d23 * d13))
 
-        # Linearly map [0, k_max] → [command_speed, min_curve_speed]
         ratio = min(1.0, worst_k / k_max)
         return self.command_speed - (self.command_speed - self.min_curve_speed) * ratio
 
-    def _compute_safe_speed(self) -> float:
-        """
-        Scales command speed based on distance to the closest obstacle.
-          dist > slow zone  : full speed
-          hard_stop < dist <= slow zone : linear ramp down toward zero
-          dist <= hard_stop : zero (hard stop handled before this is called)
-        """
-        dist = self.closest_obstacle_distance
-        if dist <= self.obstacle_hard_stop_distance:
+    def _compute_safe_speed(self):
+        dist = self.closest_person_dist
+        if dist <= self.person_stop_dist:
             return 0.0
-        if dist <= self.obstacle_distance_threshold:
-            factor = (dist - self.obstacle_hard_stop_distance) / (
-                self.obstacle_distance_threshold - self.obstacle_hard_stop_distance
-            )
-            # Floor at min_curve_speed so the ESC always gets an actionable command
-            return max(self.min_curve_speed, self.command_speed * factor)
+        if dist <= self.person_slowdown_dist:
+            factor = (dist - self.person_stop_dist) / (self.person_slowdown_dist - self.person_stop_dist)
+            return self.command_speed * factor  # ramps 0 → command_speed, no floor
         return self.command_speed
-    
+
+    # ── Publish helpers ───────────────────────────────────────────────────
+
     def publish_obstacle_information(self):
-        info_msg = Bool()
-        info_msg.data = bool(self.obstacle_stop_requested)
-        self.obstacle_information_pub.publish(info_msg)
+        msg = Bool()
+        msg.data = bool(self.obstacle_stop_requested)
+        self.obstacle_information_pub.publish(msg)
 
     def publish_stop_command(self):
+        self.smoothed_speed = 0.0
+        self.smoothed_delta = 0.0
         drive_msg = AckermannDrive()
         drive_msg.steering_angle = 0.0
         drive_msg.speed = 0.0
@@ -1066,14 +544,10 @@ class PurePursuitNode(Node):
             if rclpy.ok():
                 self.ackermann_pub.publish(drive_msg)
         except Exception as exc:
-            self.get_logger().debug(
-                f"Could not publish stop command during shutdown: {exc}"
-            )
+            self.get_logger().debug(f"Stop command error: {exc}")
+
 
 def main(args=None):
-    """
-    ROS 2 entry point.
-    """
     rclpy.init(args=args)
     node = PurePursuitNode()
     try:
@@ -1086,5 +560,6 @@ def main(args=None):
         if rclpy.ok():
             rclpy.shutdown()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

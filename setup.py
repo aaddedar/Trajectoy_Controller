@@ -23,6 +23,7 @@ setup(
         'console_scripts': [
             'pure_persuit_node       = control_car.pure_persuit_node:main',
             'dummy_tracked_objects   = control_car.dummy_tracked_objects:main',
+            'dummy_car_sim           = control_car.dummy_car_sim:main',
         ],
     },
 )
