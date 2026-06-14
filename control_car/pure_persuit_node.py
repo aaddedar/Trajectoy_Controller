@@ -10,7 +10,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
 from vision_msgs.msg import Detection3DArray
-from visualization_msgs.msg import Marker
+from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
 
 # Must match Arduino WHEELSTEERLIMIT (0.5235987756 rad = 30°).
 STEER_LIMIT = 0.5236
@@ -96,7 +97,7 @@ class PurePursuitNode(Node):
         self.avoidance_start_dist = float(self.get_parameter('avoidance_start_dist').value)
 
         self.Ts             = 1.0 / 30.0
-        self.goal_tolerance = 0.1
+        self.goal_tolerance = 0.5
 
         self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.3)
         self.controller  = PurePurSuitController(
@@ -116,8 +117,10 @@ class PurePursuitNode(Node):
         self.closest_person_dist  = float('inf')
         self.car_width            = 0.40
         self.path_corridor_margin = 1.0
-        self.avoidance_offset     = 0.0   # lateral m to shift lookahead (+left / -right in car frame)
+        self.avoidance_target     = 0.0   # desired lateral offset (set by detection callback)
+        self.avoidance_offset     = 0.0   # actual applied offset, ramped toward target each tick
         self._cte                 = 0.0   # cross-track error: + = car left of path, - = car right
+        self.closest_vlong        = 0.0   # person longitudinal velocity in car frame (+ = moving away)
 
         self.last_detection_time     = None
         self.obstacle_timeout        = 5.0
@@ -148,6 +151,9 @@ class PurePursuitNode(Node):
         self.ackermann_pub            = self.create_publisher(AckermannDrive, '/ackermann_drive', reliable_qos)
         self.obstacle_information_pub = self.create_publisher(Bool, '/obstacle_information', reliable_qos)
         self.lookahead_marker_pub     = self.create_publisher(Marker, '/pure_pursuit/lookahead_marker', 10)
+        self.avoidance_path_pub       = self.create_publisher(Path,        '/pure_pursuit/avoidance_path',   10)
+        self.original_path_ahead_pub  = self.create_publisher(Path,        '/pure_pursuit/original_path_ahead', 10)
+        self.avoidance_viz_pub        = self.create_publisher(MarkerArray, '/pure_pursuit/avoidance_viz',    10)
 
         # ── Subscribers ──────────────────────────────────────────────────────
         self.create_subscription(Path,             '/path',                    self.path_callback,                 latched_qos)
@@ -206,7 +212,8 @@ class PurePursuitNode(Node):
             self.controller.ref_path_x[-1] - self.hagen_robot.x,
             self.controller.ref_path_y[-1] - self.hagen_robot.y,
         ))
-        if goal_distance <= self.goal_tolerance:
+        near_path_end = self.controller.last_index >= len(self.controller.ref_path_x) - 5
+        if goal_distance <= self.goal_tolerance or near_path_end:
             if not self.goal_reached:
                 self.goal_reached = True
                 self.path_received = False
@@ -220,6 +227,16 @@ class PurePursuitNode(Node):
             return
 
         raw_delta, target_index = self.controller.pure_pursuit_control()
+
+        # Smooth ramp: avoidance_offset moves toward avoidance_target at 0.5 m/s
+        # (at 30 Hz that's 0.5/30 ≈ 0.017 m per tick — ~1 s to reach full 0.5 m offset)
+        RAMP_RATE = 0.5 / 30.0
+        if abs(self.avoidance_offset - self.avoidance_target) < RAMP_RATE:
+            self.avoidance_offset = self.avoidance_target
+        elif self.avoidance_offset < self.avoidance_target:
+            self.avoidance_offset += RAMP_RATE
+        else:
+            self.avoidance_offset -= RAMP_RATE
 
         # Lateral avoidance: offset lookahead point perpendicular to PATH direction.
         # Using path tangent (not car heading) so curves don't push toward walls.
@@ -297,6 +314,9 @@ class PurePursuitNode(Node):
             f"person={self.closest_person_dist:.1f}m{avoid_str}",
             throttle_duration_sec=0.5,
         )
+
+        # ── Avoidance trajectory visualisation ───────────────────────────────
+        self._publish_avoidance_viz(self.controller.last_index)
 
         # ── RViz markers ─────────────────────────────────────────────────────
         from geometry_msgs.msg import Point
@@ -453,9 +473,10 @@ class PurePursuitNode(Node):
             return
 
         corridor_half = self.car_width / 2.0 + self.path_corridor_margin
-        closest_cx   = float('inf')
-        closest_cy   = 0.0
-        closest_vlat = 0.0
+        closest_cx    = float('inf')
+        closest_cy    = 0.0
+        closest_vlat  = 0.0
+        closest_vlong = 0.0
 
         cos_t = math.cos(self.hagen_robot.theta)
         sin_t = math.sin(self.hagen_robot.theta)
@@ -473,14 +494,16 @@ class PurePursuitNode(Node):
             y_map = float(det.bbox.center.position.y)
             cx, cy = self._map_to_car_frame(x_map, y_map)
 
-            # KF velocity → lateral component in car frame (+ = moving left)
+            # KF velocity → lateral and longitudinal components in car frame
             vx_map = float(det.results[0].pose.pose.position.x)
             vy_map = float(det.results[0].pose.pose.position.y)
-            vlat   = -vx_map * sin_t + vy_map * cos_t
+            vlat   = -vx_map * sin_t + vy_map * cos_t   # + = moving left
+            vlong  =  vx_map * cos_t + vy_map * sin_t   # + = moving away from car
 
             self.get_logger().warn(
                 f"[PERSON] class='{cid}' map=({x_map:.2f},{y_map:.2f}) "
-                f"→ car fwd={cx:.2f}m lat={cy:+.2f}m vlat={vlat:+.2f}m/s",
+                f"→ car fwd={cx:.2f}m lat={cy:+.2f}m "
+                f"vlat={vlat:+.2f}m/s vlong={vlong:+.2f}m/s",
                 throttle_duration_sec=0.3,
             )
 
@@ -493,9 +516,10 @@ class PurePursuitNode(Node):
                     throttle_duration_sec=1.0)
                 continue
             if cx < closest_cx:
-                closest_cx = cx
-                closest_cy = cy
-                closest_vlat = vlat
+                closest_cx    = cx
+                closest_cy    = cy
+                closest_vlat  = vlat
+                closest_vlong = vlong
 
         if closest_cx == float('inf'):
             self.get_logger().info("[person] none in corridor ahead — clear", throttle_duration_sec=2.0)
@@ -503,6 +527,18 @@ class PurePursuitNode(Node):
             return
 
         self.closest_person_dist = closest_cx
+        self.closest_vlong       = closest_vlong
+
+        # Extend trigger distances when person walks TOWARD the car.
+        # Only uses person velocity — avoids oscillation caused by car-velocity dependency.
+        person_approach    = max(0.0, -closest_vlong)   # + only when person walks toward car
+        early_trigger_dist = self.avoidance_start_dist + person_approach * self.avoidance_predict_t
+
+        self.get_logger().warn(
+            f"[person] raw_cx={closest_cx:.2f}m  vlong={closest_vlong:+.2f}m/s  "
+            f"approach={person_approach:.2f}m/s  avoidance_triggers@{early_trigger_dist:.2f}m",
+            throttle_duration_sec=0.3,
+        )
 
         # Predict person's lateral in car frame after avoidance_predict_t s.
         lat_predicted = closest_cy + closest_vlat * self.avoidance_predict_t
@@ -526,22 +562,24 @@ class PurePursuitNode(Node):
                 avoid_dir = -self.avoidance_clearance   # car left or on center → go right
                 side_str  = f"RIGHT (centered person, cte={self._cte:+.2f}m)"
 
-        # Only start deviating once person is within avoidance_start_dist
-        if closest_cx <= self.avoidance_start_dist:
-            self.avoidance_offset = avoid_dir
+        # Avoidance START: use early_trigger_dist (extended when person walks toward).
+        # Hard STOP: use raw cx — only when physically that close, giving full distance to maneuver.
+        if closest_cx <= early_trigger_dist and closest_cx > self.person_stop_dist:
+            self.avoidance_target = avoid_dir
         else:
-            self.avoidance_offset = 0.0
+            self.avoidance_target = 0.0
 
-        if closest_cx < self.person_stop_dist:
+        if closest_cx <= self.person_stop_dist:
             self.obstacle_stop_requested = True
             self.get_logger().warn(
-                f"PERSON HARD STOP: {closest_cx:.2f}m < stop_dist={self.person_stop_dist:.1f}m",
+                f"PERSON HARD STOP: {closest_cx:.2f}m <= stop_dist={self.person_stop_dist:.1f}m",
                 throttle_duration_sec=0.3,
             )
         else:
             self.obstacle_stop_requested = False
             self.get_logger().warn(
-                f"[person] {closest_cx:.2f}m — AVOIDING {side_str}  offset={self.avoidance_offset:+.2f}m",
+                f"[person] {closest_cx:.2f}m  trigger@{early_trigger_dist:.2f}m — "
+                f"AVOIDING {side_str}  target={self.avoidance_target:+.2f}m",
                 throttle_duration_sec=0.5,
             )
 
@@ -552,7 +590,8 @@ class PurePursuitNode(Node):
             self.get_logger().info("Person cleared — resuming normal path.")
         self.obstacle_stop_requested = False
         self.closest_person_dist     = float('inf')
-        self.avoidance_offset        = 0.0
+        self.closest_vlong           = 0.0
+        self.avoidance_target        = 0.0   # ramps smoothly to 0 in control_loop
         self.publish_obstacle_information()
 
     # ── Car-frame transform ───────────────────────────────────────────────
@@ -601,12 +640,129 @@ class PurePursuitNode(Node):
 
     def _compute_safe_speed(self):
         dist = self.closest_person_dist
+        if dist == float('inf'):
+            return self.command_speed
+
+        # Extend the slowdown zone when person walks toward car.
+        # Uses only person velocity — no car-velocity term avoids stop/accelerate oscillation.
+        person_approach      = max(0.0, -self.closest_vlong)   # + when person walks toward car
+        effective_slow_dist  = self.person_slowdown_dist + person_approach * self.avoidance_predict_t
+
         if dist <= self.person_stop_dist:
             return 0.0
-        if dist <= self.person_slowdown_dist:
-            factor = (dist - self.person_stop_dist) / (self.person_slowdown_dist - self.person_stop_dist)
-            return self.command_speed * factor  # ramps 0 → command_speed, no floor
+        if dist <= effective_slow_dist:
+            factor = (dist - self.person_stop_dist) / (effective_slow_dist - self.person_stop_dist)
+            return self.command_speed * factor
         return self.command_speed
+
+    # ── Avoidance trajectory visualisation ───────────────────────────────
+
+    def _publish_avoidance_viz(self, start_index: int):
+        px  = self.controller.ref_path_x
+        py  = self.controller.ref_path_y
+        n   = len(px)
+        now = self.get_clock().now().to_msg()
+
+        AHEAD = 60   # points to show (~3 m at 5 cm spacing)
+        end   = min(start_index + AHEAD, n)
+
+        # ── Deviated path (yellow when avoiding, green when back on path) ──
+        dev_path = Path()
+        dev_path.header.stamp    = now
+        dev_path.header.frame_id = 'map'
+
+        orig_path = Path()
+        orig_path.header.stamp    = now
+        orig_path.header.frame_id = 'map'
+
+        for i in range(start_index, end):
+            # Path tangent at point i
+            if i + 1 < n:
+                pdx, pdy = float(px[i+1] - px[i]), float(py[i+1] - py[i])
+            else:
+                pdx, pdy = float(px[i] - px[i-1]), float(py[i] - py[i-1])
+            plen = math.hypot(pdx, pdy) + 1e-9
+
+            # Original path pose
+            op = PoseStamped()
+            op.header = orig_path.header
+            op.pose.position.x = float(px[i])
+            op.pose.position.y = float(py[i])
+            op.pose.position.z = 0.02
+            op.pose.orientation.w = 1.0
+            orig_path.poses.append(op)
+
+            # Deviated path pose (shifted by current avoidance_offset)
+            dp = PoseStamped()
+            dp.header = dev_path.header
+            dp.pose.position.x = float(px[i]) + self.avoidance_offset * (-pdy / plen)
+            dp.pose.position.y = float(py[i]) + self.avoidance_offset * ( pdx / plen)
+            dp.pose.position.z = 0.05
+            dp.pose.orientation.w = 1.0
+            dev_path.poses.append(dp)
+
+        self.avoidance_path_pub.publish(dev_path)
+        self.original_path_ahead_pub.publish(orig_path)
+
+        # ── Marker: coloured line strips ──────────────────────────────────
+        ma = MarkerArray()
+
+        def _line_strip(ns, mid, pts, r, g, b, z_off=0.0, width=0.04):
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp    = now
+            m.ns     = ns
+            m.id     = mid
+            m.type   = Marker.LINE_STRIP
+            m.action = Marker.ADD
+            m.scale.x = width
+            m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.85
+            m.pose.orientation.w = 1.0
+            from geometry_msgs.msg import Point
+            for p in pts:
+                pt = Point(); pt.x = p[0]; pt.y = p[1]; pt.z = p[2] + z_off
+                m.points.append(pt)
+            return m
+
+        orig_pts = [(p.pose.position.x, p.pose.position.y, 0.0) for p in orig_path.poses]
+        dev_pts  = [(p.pose.position.x, p.pose.position.y, 0.0) for p in dev_path.poses]
+
+        # Original path ahead — white
+        if orig_pts:
+            ma.markers.append(_line_strip('orig_ahead', 0, orig_pts, 1.0, 1.0, 1.0, width=0.03))
+
+        # Deviated trajectory — yellow while avoiding, cyan while returning
+        if dev_pts and abs(self.avoidance_offset) > 0.02:
+            returning = abs(self.avoidance_offset) < abs(self.avoidance_target) + 0.01 \
+                        and self.avoidance_target == 0.0
+            r, g, b = (0.0, 1.0, 1.0) if returning else (1.0, 1.0, 0.0)
+            ma.markers.append(_line_strip('deviated', 1, dev_pts, r, g, b, z_off=0.03, width=0.05))
+
+            # Lateral offset arrows at start and end to show how far off path
+            from geometry_msgs.msg import Point
+            arr = Marker()
+            arr.header.frame_id = 'map'; arr.header.stamp = now
+            arr.ns = 'offset_arrow'; arr.id = 2
+            arr.type = Marker.ARROW; arr.action = Marker.ADD
+            arr.scale.x = 0.03; arr.scale.y = 0.06; arr.scale.z = 0.06
+            arr.color.r = 1.0; arr.color.g = 0.4; arr.color.b = 0.0; arr.color.a = 1.0
+            arr.pose.orientation.w = 1.0
+            mid = len(orig_pts) // 2
+            if mid < len(orig_pts) and mid < len(dev_pts):
+                p0 = Point(); p0.x = orig_pts[mid][0]; p0.y = orig_pts[mid][1]; p0.z = 0.06
+                p1 = Point(); p1.x = dev_pts[mid][0];  p1.y = dev_pts[mid][1];  p1.z = 0.06
+                arr.points = [p0, p1]
+                ma.markers.append(arr)
+        else:
+            # Clear deviated markers when no longer avoiding
+            for mid in [1, 2]:
+                clr = Marker()
+                clr.header.frame_id = 'map'; clr.header.stamp = now
+                clr.ns = 'deviated' if mid == 1 else 'offset_arrow'
+                clr.id = mid; clr.action = Marker.DELETE
+                ma.markers.append(clr)
+
+        self.avoidance_viz_pub.publish(ma)
 
     # ── Publish helpers ───────────────────────────────────────────────────
 
@@ -616,8 +772,9 @@ class PurePursuitNode(Node):
         self.obstacle_information_pub.publish(msg)
 
     def publish_stop_command(self):
-        self.smoothed_speed = 0.0
-        self.smoothed_delta = 0.0
+        self.smoothed_speed   = 0.0
+        self.smoothed_delta   = 0.0
+        self.avoidance_target = 0.0
         drive_msg = AckermannDrive()
         drive_msg.steering_angle = 0.0
         drive_msg.speed = 0.0

@@ -16,7 +16,7 @@ def generate_launch_description():
                 'invert_steering':      False,
                 'person_stop_dist':     0.4,
                 'person_slowdown_dist': 1.5,
-                'avoidance_clearance':  0.5,
+                'avoidance_clearance':  0.3,
                 'avoidance_predict_t':  1.5,
                 'avoidance_start_dist': 1.5,
             }],
