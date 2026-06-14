@@ -78,8 +78,11 @@ class PurePursuitNode(Node):
         self.declare_parameter('min_curve_speed',       0.9)
         self.declare_parameter('L_d',                   0.30)
         self.declare_parameter('invert_steering',       False)
-        self.declare_parameter('person_stop_dist',      1.0)
-        self.declare_parameter('person_slowdown_dist',  2.5)
+        self.declare_parameter('person_stop_dist',      0.4)
+        self.declare_parameter('person_slowdown_dist',  1.5)
+        self.declare_parameter('avoidance_clearance',   0.5)
+        self.declare_parameter('avoidance_predict_t',   1.5)
+        self.declare_parameter('avoidance_start_dist',  1.5)
 
         L_d                       = float(self.get_parameter('L_d').value)
         k                         = 0.0
@@ -88,6 +91,9 @@ class PurePursuitNode(Node):
         self.invert_steering_sign = bool(self.get_parameter('invert_steering').value)
         self.person_stop_dist     = float(self.get_parameter('person_stop_dist').value)
         self.person_slowdown_dist = float(self.get_parameter('person_slowdown_dist').value)
+        self.avoidance_clearance  = float(self.get_parameter('avoidance_clearance').value)
+        self.avoidance_predict_t  = float(self.get_parameter('avoidance_predict_t').value)
+        self.avoidance_start_dist = float(self.get_parameter('avoidance_start_dist').value)
 
         self.Ts             = 1.0 / 30.0
         self.goal_tolerance = 0.1
@@ -110,6 +116,8 @@ class PurePursuitNode(Node):
         self.closest_person_dist  = float('inf')
         self.car_width            = 0.40
         self.path_corridor_margin = 1.0
+        self.avoidance_offset     = 0.0   # lateral m to shift lookahead (+left / -right in car frame)
+        self._cte                 = 0.0   # cross-track error: + = car left of path, - = car right
 
         self.last_detection_time     = None
         self.obstacle_timeout        = 5.0
@@ -212,6 +220,34 @@ class PurePursuitNode(Node):
             return
 
         raw_delta, target_index = self.controller.pure_pursuit_control()
+
+        # Lateral avoidance: offset lookahead point perpendicular to PATH direction.
+        # Using path tangent (not car heading) so curves don't push toward walls.
+        if abs(self.avoidance_offset) > 0.01:
+            px_a = self.controller.ref_path_x
+            py_a = self.controller.ref_path_y
+            t_x  = float(px_a[target_index])
+            t_y  = float(py_a[target_index])
+            # Path tangent at lookahead point
+            if target_index + 1 < len(px_a):
+                atdx = float(px_a[target_index + 1] - px_a[target_index])
+                atdy = float(py_a[target_index + 1] - py_a[target_index])
+            elif target_index > 0:
+                atdx = float(px_a[target_index] - px_a[target_index - 1])
+                atdy = float(py_a[target_index] - py_a[target_index - 1])
+            else:
+                atdx = math.cos(self.hagen_robot.theta)
+                atdy = math.sin(self.hagen_robot.theta)
+            atlen = math.hypot(atdx, atdy) + 1e-9
+            # Path left perpendicular (+offset → left of path, -offset → right of path)
+            t_x += self.avoidance_offset * (-atdy / atlen)
+            t_y += self.avoidance_offset * ( atdx / atlen)
+            alpha = math.atan2(t_y - self.hagen_robot.y, t_x - self.hagen_robot.x) - self.hagen_robot.theta
+            alpha = math.atan2(math.sin(alpha), math.cos(alpha))
+            lf    = self.controller.L_d
+            raw_delta = math.atan(2.0 * self.hagen_robot.L * math.sin(alpha) / (lf + 1e-5))
+            raw_delta = float(np.clip(raw_delta, -STEER_LIMIT, STEER_LIMIT))
+
         self.smoothed_delta = 0.5 * self.smoothed_delta + 0.5 * float(raw_delta)
         delta = self.smoothed_delta
 
@@ -245,8 +281,12 @@ class PurePursuitNode(Node):
                 ln_x = -ty_seg / seg_len
                 ln_y =  tx_seg / seg_len
                 cte_now = (self.hagen_robot.x - n_x) * ln_x + (self.hagen_robot.y - n_y) * ln_y
+        self._cte = cte_now   # + = car left of path, - = car right of path
 
         steering_cmd_deg = math.degrees(-delta if self.invert_steering_sign else delta)
+        avoid_str = ""
+        if abs(self.avoidance_offset) > 0.01:
+            avoid_str = f" | AVOID={'L' if self.avoidance_offset > 0 else 'R'}{abs(self.avoidance_offset):.1f}m"
         self.get_logger().info(
             f"pos=({self.hagen_robot.x:.2f},{self.hagen_robot.y:.2f}) "
             f"θ={math.degrees(self.hagen_robot.theta):.0f}° "
@@ -254,7 +294,7 @@ class PurePursuitNode(Node):
             f"CTE={cte_now:+.3f}m | "
             f"steer={steering_cmd_deg:+.1f}°({'L' if steering_cmd_deg>0 else 'R'}) "
             f"spd={cmd_speed:.2f}m/s | "
-            f"person={self.closest_person_dist:.1f}m",
+            f"person={self.closest_person_dist:.1f}m{avoid_str}",
             throttle_duration_sec=0.5,
         )
 
@@ -413,7 +453,12 @@ class PurePursuitNode(Node):
             return
 
         corridor_half = self.car_width / 2.0 + self.path_corridor_margin
-        closest_cx = float('inf')
+        closest_cx   = float('inf')
+        closest_cy   = 0.0
+        closest_vlat = 0.0
+
+        cos_t = math.cos(self.hagen_robot.theta)
+        sin_t = math.sin(self.hagen_robot.theta)
 
         for det in msg.detections:
             if not det.results:
@@ -428,9 +473,14 @@ class PurePursuitNode(Node):
             y_map = float(det.bbox.center.position.y)
             cx, cy = self._map_to_car_frame(x_map, y_map)
 
+            # KF velocity → lateral component in car frame (+ = moving left)
+            vx_map = float(det.results[0].pose.pose.position.x)
+            vy_map = float(det.results[0].pose.pose.position.y)
+            vlat   = -vx_map * sin_t + vy_map * cos_t
+
             self.get_logger().warn(
                 f"[PERSON] class='{cid}' map=({x_map:.2f},{y_map:.2f}) "
-                f"→ car fwd={cx:.2f}m lat={cy:.2f}m corridor_half={corridor_half:.2f}m",
+                f"→ car fwd={cx:.2f}m lat={cy:+.2f}m vlat={vlat:+.2f}m/s",
                 throttle_duration_sec=0.3,
             )
 
@@ -444,6 +494,8 @@ class PurePursuitNode(Node):
                 continue
             if cx < closest_cx:
                 closest_cx = cx
+                closest_cy = cy
+                closest_vlat = vlat
 
         if closest_cx == float('inf'):
             self.get_logger().info("[person] none in corridor ahead — clear", throttle_duration_sec=2.0)
@@ -451,6 +503,34 @@ class PurePursuitNode(Node):
             return
 
         self.closest_person_dist = closest_cx
+
+        # Predict person's lateral in car frame after avoidance_predict_t s.
+        lat_predicted = closest_cy + closest_vlat * self.avoidance_predict_t
+
+        CENTERED = 0.20   # m — if person within this band, treat as centered
+
+        if abs(lat_predicted) > CENTERED:
+            # Person clearly to one side → go to the opposite side
+            avoid_dir = -math.copysign(self.avoidance_clearance, lat_predicted)
+            side_str  = f"{'LEFT' if avoid_dir > 0 else 'RIGHT'} (person at car_lat={lat_predicted:+.2f}m)"
+        else:
+            # Person approximately centered (or stationary in middle of road).
+            # Use cross-track error to pick the side with more room:
+            #   CTE > 0 → car is LEFT of path → left side has less room → go RIGHT
+            #   CTE < 0 → car is RIGHT of path → right side has less room → go LEFT
+            #   CTE ≈ 0 → car on path center → both sides equal → default RIGHT
+            if self._cte < -0.05:
+                avoid_dir = self.avoidance_clearance    # car right of path → go left
+                side_str  = f"LEFT  (centered person, car right of path cte={self._cte:+.2f}m)"
+            else:
+                avoid_dir = -self.avoidance_clearance   # car left or on center → go right
+                side_str  = f"RIGHT (centered person, cte={self._cte:+.2f}m)"
+
+        # Only start deviating once person is within avoidance_start_dist
+        if closest_cx <= self.avoidance_start_dist:
+            self.avoidance_offset = avoid_dir
+        else:
+            self.avoidance_offset = 0.0
 
         if closest_cx < self.person_stop_dist:
             self.obstacle_stop_requested = True
@@ -461,17 +541,18 @@ class PurePursuitNode(Node):
         else:
             self.obstacle_stop_requested = False
             self.get_logger().warn(
-                f"[person] slowdown zone: {closest_cx:.2f}m",
-                throttle_duration_sec=1.0,
+                f"[person] {closest_cx:.2f}m — AVOIDING {side_str}  offset={self.avoidance_offset:+.2f}m",
+                throttle_duration_sec=0.5,
             )
 
         self.publish_obstacle_information()
 
     def _clear_obstacle(self):
         if self.obstacle_stop_requested or self.closest_person_dist < float('inf'):
-            self.get_logger().info("Person cleared — resuming.")
+            self.get_logger().info("Person cleared — resuming normal path.")
         self.obstacle_stop_requested = False
         self.closest_person_dist     = float('inf')
+        self.avoidance_offset        = 0.0
         self.publish_obstacle_information()
 
     # ── Car-frame transform ───────────────────────────────────────────────

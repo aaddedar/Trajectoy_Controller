@@ -14,8 +14,11 @@ def generate_launch_description():
                 'min_curve_speed':      0.9,
                 'L_d':                  0.30,
                 'invert_steering':      False,
-                'person_stop_dist':     1.0,
-                'person_slowdown_dist': 2.5,
+                'person_stop_dist':     0.4,
+                'person_slowdown_dist': 1.5,
+                'avoidance_clearance':  0.5,
+                'avoidance_predict_t':  1.5,
+                'avoidance_start_dist': 1.5,
             }],
         ),
     ])
