@@ -96,8 +96,9 @@ class PurePursuitNode(Node):
         self.avoidance_predict_t  = float(self.get_parameter('avoidance_predict_t').value)
         self.avoidance_start_dist = float(self.get_parameter('avoidance_start_dist').value)
 
-        self.Ts             = 1.0 / 30.0
-        self.goal_tolerance = 0.5
+        self.Ts                = 1.0 / 30.0
+        self.goal_tolerance    = 0.02   # stop within 2 cm of goal
+        self.goal_slowdown_dist = 0.5   # start decelerating 0.5 m before goal
 
         self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.3)
         self.controller  = PurePurSuitController(
@@ -212,8 +213,14 @@ class PurePursuitNode(Node):
             self.controller.ref_path_x[-1] - self.hagen_robot.x,
             self.controller.ref_path_y[-1] - self.hagen_robot.y,
         ))
-        near_path_end = self.controller.last_index >= len(self.controller.ref_path_x) - 5
-        if goal_distance <= self.goal_tolerance or near_path_end:
+
+        if goal_distance <= self.goal_slowdown_dist:
+            self.get_logger().info(
+                f"Approaching goal: {goal_distance:.2f}m remaining",
+                throttle_duration_sec=0.5,
+            )
+
+        if goal_distance <= self.goal_tolerance:
             if not self.goal_reached:
                 self.goal_reached = True
                 self.path_received = False
@@ -240,7 +247,25 @@ class PurePursuitNode(Node):
 
         # Lateral avoidance: offset lookahead point perpendicular to PATH direction.
         # Using path tangent (not car heading) so curves don't push toward walls.
-        if abs(self.avoidance_offset) > 0.01:
+        #
+        # effective_offset is reduced in two situations:
+        #   1. Curves: scale linearly to 0 as steering approaches STEER_LIMIT —
+        #              avoidance on a tight curve compounds steering and exits road.
+        #   2. CTE clamp: if the car is already displaced in the avoidance direction,
+        #              subtract that CTE so total path deviation ≤ avoidance_clearance.
+        effective_offset = self.avoidance_offset
+        if abs(effective_offset) > 0.01:
+            # 1. Reduce on curves (raw_delta = pure-pursuit angle before avoidance)
+            curve_factor     = min(1.0, abs(raw_delta) / STEER_LIMIT)
+            effective_offset *= (1.0 - curve_factor)
+
+            # 2. CTE clamp: available space in avoidance direction
+            cte_in_dir   = self._cte * math.copysign(1.0, effective_offset)
+            available    = max(0.0, self.avoidance_clearance - max(0.0, cte_in_dir))
+            if abs(effective_offset) > available:
+                effective_offset = math.copysign(available, effective_offset)
+
+        if abs(effective_offset) > 0.01:
             px_a = self.controller.ref_path_x
             py_a = self.controller.ref_path_y
             t_x  = float(px_a[target_index])
@@ -257,8 +282,8 @@ class PurePursuitNode(Node):
                 atdy = math.sin(self.hagen_robot.theta)
             atlen = math.hypot(atdx, atdy) + 1e-9
             # Path left perpendicular (+offset → left of path, -offset → right of path)
-            t_x += self.avoidance_offset * (-atdy / atlen)
-            t_y += self.avoidance_offset * ( atdx / atlen)
+            t_x += effective_offset * (-atdy / atlen)
+            t_y += effective_offset * ( atdx / atlen)
             alpha = math.atan2(t_y - self.hagen_robot.y, t_x - self.hagen_robot.x) - self.hagen_robot.theta
             alpha = math.atan2(math.sin(alpha), math.cos(alpha))
             lf    = self.controller.L_d
@@ -268,10 +293,18 @@ class PurePursuitNode(Node):
         self.smoothed_delta = 0.5 * self.smoothed_delta + 0.5 * float(raw_delta)
         delta = self.smoothed_delta
 
+        # Goal approach ramp: linearly reduce speed from command_speed → 0
+        # over the last goal_slowdown_dist metres so the car arrives at exact goal.
+        goal_speed = self.command_speed
+        if goal_distance < self.goal_slowdown_dist:
+            ramp = goal_distance / self.goal_slowdown_dist
+            goal_speed = self.command_speed * max(0.0, ramp)
+
         raw_speed = float(min(
             self._compute_curve_speed(delta),
             self._compute_ahead_curvature_speed(),
             self._compute_safe_speed(),
+            goal_speed,
         ))
         # Brake fast, accelerate slowly — keeps path tight on curves
         if raw_speed < self.smoothed_speed:
@@ -303,7 +336,10 @@ class PurePursuitNode(Node):
         steering_cmd_deg = math.degrees(-delta if self.invert_steering_sign else delta)
         avoid_str = ""
         if abs(self.avoidance_offset) > 0.01:
-            avoid_str = f" | AVOID={'L' if self.avoidance_offset > 0 else 'R'}{abs(self.avoidance_offset):.1f}m"
+            avoid_str = (
+                f" | AVOID={'L' if self.avoidance_offset > 0 else 'R'}"
+                f"  target={self.avoidance_offset:+.2f}m  eff={effective_offset:+.2f}m"
+            )
         self.get_logger().info(
             f"pos=({self.hagen_robot.x:.2f},{self.hagen_robot.y:.2f}) "
             f"θ={math.degrees(self.hagen_robot.theta):.0f}° "
