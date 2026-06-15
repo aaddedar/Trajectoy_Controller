@@ -78,6 +78,7 @@ class PurePursuitNode(Node):
         self.declare_parameter('command_speed',         1.4)
         self.declare_parameter('min_curve_speed',       0.9)
         self.declare_parameter('L_d',                   0.30)
+        self.declare_parameter('k',                     0.3)
         self.declare_parameter('invert_steering',       False)
         self.declare_parameter('person_stop_dist',      0.4)
         self.declare_parameter('person_slowdown_dist',  1.5)
@@ -86,7 +87,7 @@ class PurePursuitNode(Node):
         self.declare_parameter('avoidance_start_dist',  1.5)
 
         L_d                       = float(self.get_parameter('L_d').value)
-        k                         = 0.0
+        k                         = float(self.get_parameter('k').value)
         self.command_speed        = float(self.get_parameter('command_speed').value)
         self.min_curve_speed      = float(self.get_parameter('min_curve_speed').value)
         self.invert_steering_sign = bool(self.get_parameter('invert_steering').value)
@@ -99,6 +100,9 @@ class PurePursuitNode(Node):
         self.Ts                = 1.0 / 30.0
         self.goal_tolerance    = 0.02   # stop within 2 cm of goal
         self.goal_slowdown_dist = 0.5   # start decelerating 0.5 m before goal
+
+        self._base_L_d   = L_d
+        self._k          = k
 
         self.hagen_robot = HagenRobot(x=0.0, y=0.0, theta=0.0, v=0.0, L=0.3)
         self.controller  = PurePurSuitController(
@@ -124,7 +128,7 @@ class PurePursuitNode(Node):
         self.closest_vlong        = 0.0   # person longitudinal velocity in car frame (+ = moving away)
 
         self.last_detection_time     = None
-        self.obstacle_timeout        = 5.0
+        self.obstacle_timeout        = 1.0
         self.last_kinematic_time     = None
         self.kinematic_state_timeout = 3.0
 
@@ -159,7 +163,7 @@ class PurePursuitNode(Node):
         # ── Subscribers ──────────────────────────────────────────────────────
         self.create_subscription(Path,             '/path',                    self.path_callback,                 latched_qos)
         self.create_subscription(AckermannDrive,   '/ackermann_drive_feedback', self.ackermann_feedback_callback,  best_effort_qos)
-        self.create_subscription(Bool,             '/allowed_to_move',         self.allowed_to_move_callback,      reliable_qos)
+        self.create_subscription(Bool,             '/allowed_to_move',         self.allowed_to_move_callback,      best_effort_qos)
         self.create_subscription(Detection3DArray, '/tracked_objects',         self.objects_in_map_frame_callback, best_effort_qos)
         self.create_subscription(KinematicState,   '/kinematic_state',         self.kinematic_state_callback,      best_effort_qos)
 
@@ -168,7 +172,7 @@ class PurePursuitNode(Node):
 
         self.get_logger().info(
             f"\nPurePursuitNode started.\n"
-            f"  L_d={L_d:.2f}m  speed={self.command_speed:.1f}m/s  "
+            f"  L_d={L_d:.2f}m  k={k:.2f}  speed={self.command_speed:.1f}m/s  "
             f"min_speed={self.min_curve_speed:.1f}m/s  invert={self.invert_steering_sign}\n"
             f"  person_stop_dist={self.person_stop_dist:.1f}m  "
             f"person_slowdown_dist={self.person_slowdown_dist:.1f}m\n"
@@ -233,6 +237,8 @@ class PurePursuitNode(Node):
             self.publish_stop_command()
             return
 
+        self.controller.L_d = self._compute_adaptive_L_d(self.smoothed_delta, self.hagen_robot.v)
+
         raw_delta, target_index = self.controller.pure_pursuit_control()
 
         # Smooth ramp: avoidance_offset moves toward avoidance_target at 0.5 m/s
@@ -290,15 +296,10 @@ class PurePursuitNode(Node):
             raw_delta = math.atan(2.0 * self.hagen_robot.L * math.sin(alpha) / (lf + 1e-5))
             raw_delta = float(np.clip(raw_delta, -STEER_LIMIT, STEER_LIMIT))
 
-        self.smoothed_delta = 0.5 * self.smoothed_delta + 0.5 * float(raw_delta)
+        self.smoothed_delta = 0.8 * self.smoothed_delta + 0.2 * float(raw_delta)
         delta = self.smoothed_delta
 
-        # Goal approach ramp: linearly reduce speed from command_speed → 0
-        # over the last goal_slowdown_dist metres so the car arrives at exact goal.
-        goal_speed = self.command_speed
-        if goal_distance < self.goal_slowdown_dist:
-            ramp = goal_distance / self.goal_slowdown_dist
-            goal_speed = self.command_speed * max(0.0, ramp)
+        goal_speed = self._compute_goal_speed(goal_distance)
 
         raw_speed = float(min(
             self._compute_curve_speed(delta),
@@ -310,7 +311,7 @@ class PurePursuitNode(Node):
         if raw_speed < self.smoothed_speed:
             self.smoothed_speed = raw_speed                               # instant brake
         else:
-            self.smoothed_speed = 0.85 * self.smoothed_speed + 0.15 * raw_speed  # slow ramp-up
+            self.smoothed_speed = 0.75 * self.smoothed_speed + 0.25 * raw_speed  # ramp-up
         cmd_speed = self.smoothed_speed
 
         # ── Logging ──────────────────────────────────────────────────────────
@@ -565,58 +566,22 @@ class PurePursuitNode(Node):
         self.closest_person_dist = closest_cx
         self.closest_vlong       = closest_vlong
 
-        # Extend trigger distances when person walks TOWARD the car.
-        # Only uses person velocity — avoids oscillation caused by car-velocity dependency.
-        person_approach    = max(0.0, -closest_vlong)   # + only when person walks toward car
-        early_trigger_dist = self.avoidance_start_dist + person_approach * self.avoidance_predict_t
+        obstacle_stop, avoidance_target, early_trigger_dist = \
+            self._decide_avoidance_action(closest_cx, closest_cy, closest_vlat, closest_vlong)
 
         self.get_logger().warn(
             f"[person] raw_cx={closest_cx:.2f}m  vlong={closest_vlong:+.2f}m/s  "
-            f"approach={person_approach:.2f}m/s  avoidance_triggers@{early_trigger_dist:.2f}m",
+            f"avoidance_triggers@{early_trigger_dist:.2f}m  target={avoidance_target:+.2f}m",
             throttle_duration_sec=0.3,
         )
 
-        # Predict person's lateral in car frame after avoidance_predict_t s.
-        lat_predicted = closest_cy + closest_vlat * self.avoidance_predict_t
+        self.avoidance_target        = avoidance_target
+        self.obstacle_stop_requested = obstacle_stop
 
-        CENTERED = 0.20   # m — if person within this band, treat as centered
-
-        if abs(lat_predicted) > CENTERED:
-            # Person clearly to one side → go to the opposite side
-            avoid_dir = -math.copysign(self.avoidance_clearance, lat_predicted)
-            side_str  = f"{'LEFT' if avoid_dir > 0 else 'RIGHT'} (person at car_lat={lat_predicted:+.2f}m)"
-        else:
-            # Person approximately centered (or stationary in middle of road).
-            # Use cross-track error to pick the side with more room:
-            #   CTE > 0 → car is LEFT of path → left side has less room → go RIGHT
-            #   CTE < 0 → car is RIGHT of path → right side has less room → go LEFT
-            #   CTE ≈ 0 → car on path center → both sides equal → default RIGHT
-            if self._cte < -0.05:
-                avoid_dir = self.avoidance_clearance    # car right of path → go left
-                side_str  = f"LEFT  (centered person, car right of path cte={self._cte:+.2f}m)"
-            else:
-                avoid_dir = -self.avoidance_clearance   # car left or on center → go right
-                side_str  = f"RIGHT (centered person, cte={self._cte:+.2f}m)"
-
-        # Avoidance START: use early_trigger_dist (extended when person walks toward).
-        # Hard STOP: use raw cx — only when physically that close, giving full distance to maneuver.
-        if closest_cx <= early_trigger_dist and closest_cx > self.person_stop_dist:
-            self.avoidance_target = avoid_dir
-        else:
-            self.avoidance_target = 0.0
-
-        if closest_cx <= self.person_stop_dist:
-            self.obstacle_stop_requested = True
+        if obstacle_stop:
             self.get_logger().warn(
                 f"PERSON HARD STOP: {closest_cx:.2f}m <= stop_dist={self.person_stop_dist:.1f}m",
                 throttle_duration_sec=0.3,
-            )
-        else:
-            self.obstacle_stop_requested = False
-            self.get_logger().warn(
-                f"[person] {closest_cx:.2f}m  trigger@{early_trigger_dist:.2f}m — "
-                f"AVOIDING {side_str}  target={self.avoidance_target:+.2f}m",
-                throttle_duration_sec=0.5,
             )
 
         self.publish_obstacle_information()
@@ -642,6 +607,38 @@ class PurePursuitNode(Node):
         return cx, cy
 
     # ── Speed scaling ─────────────────────────────────────────────────────
+
+    def _decide_avoidance_action(self, cx, cy, vlat, vlong):
+        """Return (obstacle_stop, avoidance_target, early_trigger_dist) for one person."""
+        person_approach    = max(0.0, -vlong)
+        early_trigger_dist = self.avoidance_start_dist + person_approach * self.avoidance_predict_t
+
+        lat_predicted = cy + vlat * self.avoidance_predict_t
+        CENTERED = 0.20
+        if abs(lat_predicted) > CENTERED:
+            avoid_dir = -math.copysign(self.avoidance_clearance, lat_predicted)
+        else:
+            if self._cte < -0.05:
+                avoid_dir = self.avoidance_clearance
+            else:
+                avoid_dir = -self.avoidance_clearance
+
+        if cx <= self.person_stop_dist:
+            return True, 0.0, early_trigger_dist
+        if cx <= early_trigger_dist:
+            return False, avoid_dir, early_trigger_dist
+        return False, 0.0, early_trigger_dist
+
+    def _compute_goal_speed(self, goal_distance):
+        if goal_distance < self.goal_slowdown_dist:
+            ramp = goal_distance / self.goal_slowdown_dist
+            return self.command_speed * max(0.0, ramp)
+        return self.command_speed
+
+    def _compute_adaptive_L_d(self, prev_delta, speed):
+        curve_factor = min(1.0, abs(prev_delta) / STEER_LIMIT)
+        adaptive = (self._base_L_d + self._k * abs(speed)) * (1.0 - 0.6 * curve_factor)
+        return max(self._base_L_d * 0.5, adaptive)
 
     def _compute_curve_speed(self, delta):
         # sqrt mapping: speed drops steeply even at small steer angles
