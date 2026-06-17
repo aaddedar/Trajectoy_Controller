@@ -115,9 +115,6 @@ The trajectory controller shall publish a command with target velocity **0 m/s**
 - `/kinematic_state` has not been received since node startup
 - `/kinematic_state` has not been received for more than **3 s** (`kinematic_state_timeout`)
 
-> **Limitation:** `/ackermann_drive_feedback` staleness is **not** monitored. The node does not
-> stop if feedback is absent or outdated.
-
 
 ---
 
@@ -197,13 +194,6 @@ obstacle position) the car steers toward the roomier side regardless of where th
 |---|---|
 | `> +0.15 m` (person predicted left) | Steer **right** |
 | `< −0.15 m` (person predicted right) | Steer **left** |
-| `|lat_predicted| ≤ 0.15 m` (centered) | Steer toward the side with **more map clearance** |
-
-> **Note — corrections to original AC05:**
-> Centered threshold is **±0.15 m** (not ±0.20 m).
-> The tiebreaker for centered persons is **map clearance**, not CTE — CTE does not indicate
-> whether a wall is on that side.
-
 
 ---
 
@@ -240,11 +230,6 @@ normal path following:
 
 `/obstacle_information` is also published after every detection update so external nodes
 always have the current stop state.
-
-> **Note — correction to original AC07:** Timeout is **1 second** (not 5 s) — the KF tracker
-> publishes continuously while a person is visible; 5 s would keep the car stopped long after
-> the person has moved away. The full avoidance state (`_avoidance_active`, `avoidance_target`)
-> is also reset on timeout, which was not mentioned in the original AC.
 
 ---
 
