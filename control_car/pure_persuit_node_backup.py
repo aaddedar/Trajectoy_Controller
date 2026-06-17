@@ -5,7 +5,7 @@ import numpy as np
 import rclpy
 from ackermann_msgs.msg import AckermannDrive
 from curobot_msgs.msg import KinematicState
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
@@ -44,7 +44,7 @@ class PurePurSuitController:
             - self.hagen_robot.theta
         )
         alpha = np.arctan2(np.sin(alpha), np.cos(alpha))
-        LF = self.L_d  # already full adaptive LF, set each tick by control_loop
+        LF = self.k * abs(self.hagen_robot.v) + self.L_d
         delta = np.arctan(2 * self.hagen_robot.L * np.sin(alpha) / (LF + 1e-5))
         delta = np.clip(delta, -STEER_LIMIT, STEER_LIMIT)
         return delta, target_index
@@ -60,7 +60,7 @@ class PurePurSuitController:
         self.last_index = max(search_start, index)
 
         L = 0.0
-        LF = self.L_d  # already adaptive (includes k*v); don't double-count
+        LF = self.k * abs(self.hagen_robot.v) + self.L_d
         while LF > L and (index + 1) < n:
             step_x = self.ref_path_x[index + 1] - self.ref_path_x[index]
             step_y = self.ref_path_y[index + 1] - self.ref_path_y[index]
@@ -82,12 +82,11 @@ class PurePursuitNode(Node):
         self.declare_parameter('invert_steering',       False)
         self.declare_parameter('person_stop_dist',      0.4)
         self.declare_parameter('person_slowdown_dist',  1.5)
-        self.declare_parameter('avoidance_clearance',   0.6)
+        self.declare_parameter('avoidance_clearance',   0.3)
         self.declare_parameter('avoidance_predict_t',   1.5)
         self.declare_parameter('avoidance_start_dist',  1.5)
-        self.declare_parameter('map_topic',             '/map')
-        self.declare_parameter('map_free_threshold',    50)
-        self.declare_parameter('avoidance_clear_hold',  6.0)
+        self.declare_parameter('avoidance_hold_secs',   3.0)
+        self.declare_parameter('lane_half_width',       1.5)
 
         L_d                       = float(self.get_parameter('L_d').value)
         k                         = float(self.get_parameter('k').value)
@@ -99,9 +98,8 @@ class PurePursuitNode(Node):
         self.avoidance_clearance  = float(self.get_parameter('avoidance_clearance').value)
         self.avoidance_predict_t  = float(self.get_parameter('avoidance_predict_t').value)
         self.avoidance_start_dist = float(self.get_parameter('avoidance_start_dist').value)
-        map_topic                    = str(self.get_parameter('map_topic').value)
-        self.map_free_threshold      = int(self.get_parameter('map_free_threshold').value)
-        self._CLEAR_HOLD_TIME        = float(self.get_parameter('avoidance_clear_hold').value)
+        self.avoidance_hold_secs  = float(self.get_parameter('avoidance_hold_secs').value)
+        self.lane_half_width      = float(self.get_parameter('lane_half_width').value)
 
         self.Ts                = 1.0 / 30.0
         self.goal_tolerance    = 0.02   # stop within 2 cm of goal
@@ -128,10 +126,13 @@ class PurePursuitNode(Node):
         self.closest_person_dist  = float('inf')
         self.car_width            = 0.40
         self.path_corridor_margin = 1.0
-        self.avoidance_target     = 0.0   # desired lateral offset (set by detection callback)
-        self.avoidance_offset     = 0.0   # actual applied offset, ramped toward target each tick
-        self._cte                 = 0.0   # cross-track error: + = car left of path, - = car right
-        self.closest_vlong        = 0.0   # person longitudinal velocity in car frame (+ = moving away)
+        self.avoidance_target      = 0.0   # desired lateral offset (set by detection callback)
+        self.avoidance_offset      = 0.0   # actual applied offset, ramped toward target each tick
+        self._cte                  = 0.0   # cross-track error: + = car left of path, - = car right
+        self.closest_vlong         = 0.0   # person longitudinal velocity in car frame (+ = moving away)
+        self.avoidance_state       = 'normal'  # 'normal' → 'avoiding' → 'returning' → 'normal'
+        self._avoidance_clear_time = None
+        self.closest_person_cy     = 0.0
 
         self.last_detection_time     = None
         self.obstacle_timeout        = 1.0
@@ -140,10 +141,6 @@ class PurePursuitNode(Node):
 
         self.smoothed_speed = 0.0
         self.smoothed_delta = 0.0
-
-        self._occ_map = None   # inflated OccupancyGrid, updated by _map_callback
-        self._avoidance_active   = False  # True while actively steering around an obstacle
-        self._clear_since_time   = None   # wall-clock sec when person first left corridor
 
         # ── QoS ─────────────────────────────────────────────────────────────
         reliable_qos = QoSProfile(
@@ -176,7 +173,6 @@ class PurePursuitNode(Node):
         self.create_subscription(Bool,             '/allowed_to_move',         self.allowed_to_move_callback,      best_effort_qos)
         self.create_subscription(Detection3DArray, '/tracked_objects',         self.objects_in_map_frame_callback, best_effort_qos)
         self.create_subscription(KinematicState,   '/kinematic_state',         self.kinematic_state_callback,      best_effort_qos)
-        self.create_subscription(OccupancyGrid,    map_topic,                  self._map_callback,                 latched_qos)
 
         self.create_timer(self.Ts, self.control_loop)
         self.create_timer(0.5,    self._check_obstacle_timeout)
@@ -206,20 +202,10 @@ class PurePursuitNode(Node):
             return
 
         if self.obstacle_stop_requested:
-            # Brake to zero but keep last avoidance steering so the car steers
-            # away from the obstacle while decelerating instead of going straight into it.
-            self.smoothed_speed = 0.0
-            drive_msg = AckermannDrive()
-            drive_msg.speed = 0.0
-            drive_msg.steering_angle = float(
-                -self.smoothed_delta if self.invert_steering_sign else self.smoothed_delta
-            )
-            self.ackermann_pub.publish(drive_msg)
-            self.publish_obstacle_information()
+            self.publish_stop_command()
             self.get_logger().warn(
                 f"STOPPED: person at {self.closest_person_dist:.2f}m "
-                f"(stop_zone={self.person_stop_dist:.1f}m) "
-                f"steer={math.degrees(self.smoothed_delta):+.1f}°",
+                f"(hard-stop zone={self.person_stop_dist:.1f}m)",
                 throttle_duration_sec=0.5,
             )
             return
@@ -254,10 +240,6 @@ class PurePursuitNode(Node):
                 self.controller.last_index = 0
                 self.closest_person_dist = float('inf')
                 self.obstacle_stop_requested = False
-                self._avoidance_active   = False
-                self._clear_since_time   = None
-                self.avoidance_target    = 0.0
-                self.avoidance_offset    = 0.0
                 self.get_logger().info(f"Goal reached ({goal_distance:.3f}m). Path cleared.")
             self.publish_stop_command()
             return
@@ -266,42 +248,29 @@ class PurePursuitNode(Node):
 
         raw_delta, target_index = self.controller.pure_pursuit_control()
 
-        # Two ramp rates:
-        #   RAMP_UP  : fast — reach full avoidance offset in ~0.3 s (urgent)
-        #   RAMP_DOWN: slow — return to path in ~4 s (don't snap back before person fully passed)
-        RAMP_UP   = 2.0 / 30.0
-        RAMP_DOWN = 0.15 / 30.0
-        error = self.avoidance_target - self.avoidance_offset
-        if abs(error) < 0.005:
+        # Avoidance ramps out fast (0.5 m/s) to clear the obstacle in time.
+        # Returns slowly (0.15 m/s) so pure pursuit doesn't overshoot back onto path.
+        RAMP_RATE = (0.15 if self.avoidance_state == 'returning' else 0.5) / 30.0
+        if abs(self.avoidance_offset - self.avoidance_target) < RAMP_RATE:
             self.avoidance_offset = self.avoidance_target
-        elif error > 0:
-            self.avoidance_offset += min(RAMP_UP,   error)
+        elif self.avoidance_offset < self.avoidance_target:
+            self.avoidance_offset += RAMP_RATE
         else:
-            rate = RAMP_DOWN if self.avoidance_target == 0.0 else RAMP_UP
-            self.avoidance_offset += max(-rate, error)
+            self.avoidance_offset -= RAMP_RATE
+
+        if self.avoidance_state == 'returning' and abs(self.avoidance_offset) < 0.02 and abs(self.avoidance_target) < 0.01:
+            self.avoidance_state = 'normal'
+            self.get_logger().info("Avoidance complete — back on path.")
 
         # Lateral avoidance: offset lookahead point perpendicular to PATH direction.
         # Using path tangent (not car heading) so curves don't push toward walls.
-        #
-        # effective_offset is reduced in two situations:
-        #   1. Curves: scale linearly to 0 as steering approaches STEER_LIMIT —
-        #              avoidance on a tight curve compounds steering and exits road.
-        #   2. CTE clamp: if the car is already displaced in the avoidance direction,
-        #              subtract that CTE so total path deviation ≤ avoidance_clearance.
+        # Only the CTE hard cap limits effective_offset — curve_factor was removed because
+        # it zeroed avoidance on any moderate turn, defeating the purpose entirely.
         effective_offset = self.avoidance_offset
         if abs(effective_offset) > 0.01:
-            # 1. Reduce on curves (raw_delta = pure-pursuit angle before avoidance)
-            curve_factor     = min(1.0, abs(raw_delta) / STEER_LIMIT)
-            effective_offset *= (1.0 - curve_factor)
-
-            # 2. CTE clamp: available space in avoidance direction.
-            # Window = actual target magnitude + 0.1 m margin, NOT avoidance_clearance,
-            # so the car can achieve the full offset even when avoidance_clearance is
-            # set small in the launch file.
-            cte_in_dir   = self._cte * math.copysign(1.0, effective_offset)
-            avoidance_window = abs(self.avoidance_target) + 0.1 if self.avoidance_target != 0.0 \
-                               else self.avoidance_clearance
-            available    = max(0.0, avoidance_window - max(0.0, cte_in_dir))
+            # CTE hard cap: keep car within lane boundary
+            cte_in_dir = self._cte * math.copysign(1.0, effective_offset)
+            available  = max(0.0, self.lane_half_width - max(0.0, cte_in_dir))
             if abs(effective_offset) > available:
                 effective_offset = math.copysign(available, effective_offset)
 
@@ -330,11 +299,7 @@ class PurePursuitNode(Node):
             raw_delta = math.atan(2.0 * self.hagen_robot.L * math.sin(alpha) / (lf + 1e-5))
             raw_delta = float(np.clip(raw_delta, -STEER_LIMIT, STEER_LIMIT))
 
-        # Heavy filter on normal straight driving to suppress micro-corrections.
-        # Lighter filter only when avoidance is active so the car reacts quickly
-        # to steer around the obstacle.  0.75 → settles in ~4 ticks; 0.50 → 2 ticks.
-        steer_alpha = 0.50 if self._avoidance_active else 0.75
-        self.smoothed_delta = steer_alpha * self.smoothed_delta + (1.0 - steer_alpha) * float(raw_delta)
+        self.smoothed_delta = 0.8 * self.smoothed_delta + 0.2 * float(raw_delta)
         delta = self.smoothed_delta
 
         goal_speed = self._compute_goal_speed(goal_distance)
@@ -345,7 +310,6 @@ class PurePursuitNode(Node):
             self._compute_safe_speed(),
             goal_speed,
         ))
-        # Brake fast, accelerate slowly — keeps path tight on curves
         if raw_speed < self.smoothed_speed:
             self.smoothed_speed = raw_speed                               # instant brake
         else:
@@ -447,13 +411,21 @@ class PurePursuitNode(Node):
         if elapsed > self.obstacle_timeout and (
             self.obstacle_stop_requested or self.closest_person_dist < float('inf')
         ):
-            self.get_logger().info(f"No detections for {elapsed:.1f}s — clearing, resuming.")
+            self.get_logger().info(f"No detections for {elapsed:.1f}s — clearing stop flag.")
             self.obstacle_stop_requested = False
             self.closest_person_dist     = float('inf')
-            self._avoidance_active       = False
-            self._clear_since_time       = None
-            self.avoidance_target        = 0.0
             self.publish_obstacle_information()
+
+        if self.avoidance_state == 'avoiding' and elapsed > self.obstacle_timeout:
+            if self._avoidance_clear_time is None:
+                self._avoidance_clear_time = now
+            hold_elapsed = (now - self._avoidance_clear_time).nanoseconds / 1e9
+            if hold_elapsed >= self.avoidance_hold_secs:
+                self.get_logger().info(
+                    f"No detections for {elapsed:.1f}s — hold expired, returning to path.")
+                self.avoidance_state       = 'returning'
+                self.avoidance_target      = 0.0
+                self._avoidance_clear_time = None
 
     # ── Path processing ───────────────────────────────────────────────────
 
@@ -555,10 +527,7 @@ class PurePursuitNode(Node):
         closest_cy     = 0.0
         closest_vlat   = 0.0
         closest_vlong  = 0.0
-        closest_x_map  = 0.0
-        closest_y_map  = 0.0
-        closest_vx_map = 0.0
-        closest_vy_map = 0.0
+        closest_half_w = 0.30   # fallback
 
         cos_t = math.cos(self.hagen_robot.theta)
         sin_t = math.sin(self.hagen_robot.theta)
@@ -576,6 +545,11 @@ class PurePursuitNode(Node):
             y_map = float(det.bbox.center.position.y)
             cx, cy = self._map_to_car_frame(x_map, y_map)
 
+            # Person half-width from bbox: take max dimension (bbox may be axis-aligned),
+            # floor at 0.30 m (real person ~60 cm wide; tracker often under-reports).
+            half_w = max(float(det.bbox.size.x), float(det.bbox.size.y)) / 2.0
+            half_w = max(half_w, 0.30)
+
             # KF velocity → lateral and longitudinal components in car frame
             vx_map = float(det.results[0].pose.pose.position.x)
             vy_map = float(det.results[0].pose.pose.position.y)
@@ -584,7 +558,7 @@ class PurePursuitNode(Node):
 
             self.get_logger().warn(
                 f"[PERSON] class='{cid}' map=({x_map:.2f},{y_map:.2f}) "
-                f"→ car fwd={cx:.2f}m lat={cy:+.2f}m "
+                f"→ car fwd={cx:.2f}m lat={cy:+.2f}m half_w={half_w:.2f}m "
                 f"vlat={vlat:+.2f}m/s vlong={vlong:+.2f}m/s",
                 throttle_duration_sec=0.3,
             )
@@ -602,10 +576,7 @@ class PurePursuitNode(Node):
                 closest_cy     = cy
                 closest_vlat   = vlat
                 closest_vlong  = vlong
-                closest_x_map  = x_map
-                closest_y_map  = y_map
-                closest_vx_map = vx_map
-                closest_vy_map = vy_map
+                closest_half_w = half_w
 
         if closest_cx == float('inf'):
             self.get_logger().info("[person] none in corridor ahead — clear", throttle_duration_sec=2.0)
@@ -614,24 +585,24 @@ class PurePursuitNode(Node):
 
         self.closest_person_dist = closest_cx
         self.closest_vlong       = closest_vlong
+        self.closest_person_cy   = closest_cy
 
         obstacle_stop, avoidance_target, early_trigger_dist = \
-            self._decide_avoidance_action(
-                closest_cx, closest_cy, closest_vlat, closest_vlong,
-                closest_x_map, closest_y_map, closest_vx_map, closest_vy_map,
-            )
+            self._decide_avoidance_action(closest_cx, closest_cy, closest_vlat, closest_vlong, closest_half_w)
 
         self.get_logger().warn(
-            f"[person] raw_cx={closest_cx:.2f}m  vlong={closest_vlong:+.2f}m/s  "
-            f"avoidance_triggers@{early_trigger_dist:.2f}m  target={avoidance_target:+.2f}m",
+            f"[person] raw_cx={closest_cx:.2f}m  lat={closest_cy:+.2f}m  half_w={closest_half_w:.2f}m  "
+            f"vlong={closest_vlong:+.2f}m/s  avoidance_triggers@{early_trigger_dist:.2f}m  "
+            f"target={avoidance_target:+.2f}m",
             throttle_duration_sec=0.3,
         )
 
         self.avoidance_target        = avoidance_target
         self.obstacle_stop_requested = obstacle_stop
-        self._clear_since_time = None   # person still visible — reset the clear timer
+
         if avoidance_target != 0.0:
-            self._avoidance_active = True
+            self.avoidance_state       = 'avoiding'
+            self._avoidance_clear_time = None
 
         if obstacle_stop:
             self.get_logger().warn(
@@ -642,39 +613,35 @@ class PurePursuitNode(Node):
         self.publish_obstacle_information()
 
     def _clear_obstacle(self):
-        """Called every detection tick when no person is found in the corridor.
-
-        Holds the avoidance offset for _CLEAR_HOLD_TIME seconds after the person
-        leaves the corridor.  Time-based (not frame-based) so the hold is the same
-        regardless of how fast the tracker publishes.  If the person reappears
-        before the timer expires, _clear_since_time is reset in the detection path
-        so the hold restarts from the moment they leave again.
-        """
-        self.obstacle_stop_requested = False
-        self.closest_person_dist     = float('inf')
-        self.closest_vlong           = 0.0
-
-        if self._avoidance_active:
-            now_sec = self.get_clock().now().nanoseconds / 1e9
-            if self._clear_since_time is None:
-                self._clear_since_time = now_sec   # start the clock
-
-            elapsed = now_sec - self._clear_since_time
-            if elapsed < self._CLEAR_HOLD_TIME:
+        if self.avoidance_state == 'avoiding':
+            now = self.get_clock().now()
+            if self._avoidance_clear_time is None:
+                self._avoidance_clear_time = now
+            elapsed = (now - self._avoidance_clear_time).nanoseconds / 1e9
+            if elapsed < self.avoidance_hold_secs:
+                # Still in hold window — clear stop flag but keep the lane offset
+                self.obstacle_stop_requested = False
+                self.closest_person_dist     = float('inf')
+                self.closest_vlong           = 0.0
+                self.closest_person_cy       = 0.0
                 self.get_logger().info(
-                    f"Person left corridor — holding avoidance "
-                    f"({elapsed:.1f}/{self._CLEAR_HOLD_TIME:.1f}s)",
+                    f"[avoid] obstacle left corridor — holding offset "
+                    f"({elapsed:.1f}/{self.avoidance_hold_secs:.1f}s)",
                     throttle_duration_sec=0.5,
                 )
                 self.publish_obstacle_information()
                 return
+            self.avoidance_state       = 'returning'
+            self._avoidance_clear_time = None
+            self.get_logger().info("Avoidance hold complete — returning to path.")
 
-            self.get_logger().info(
-                f"Person clear for {elapsed:.1f}s — resuming path.")
-
-        self._avoidance_active = False
-        self._clear_since_time = None
-        self.avoidance_target  = 0.0   # ramps slowly back via RAMP_DOWN in control_loop
+        if self.obstacle_stop_requested or self.closest_person_dist < float('inf'):
+            self.get_logger().info("Person cleared — resuming normal path.")
+        self.obstacle_stop_requested = False
+        self.closest_person_dist     = float('inf')
+        self.closest_vlong           = 0.0
+        self.closest_person_cy       = 0.0
+        self.avoidance_target        = 0.0
         self.publish_obstacle_information()
 
     # ── Car-frame transform ───────────────────────────────────────────────
@@ -688,177 +655,65 @@ class PurePursuitNode(Node):
         cy = -dx * sin_t + dy * cos_t
         return cx, cy
 
-    # ── Map callback ──────────────────────────────────────────────────────
-
-    def _map_callback(self, msg):
-        self._occ_map = msg
-
-    # ── Map free-space probe ──────────────────────────────────────────────
-
-    def _map_free_clearance(self, px, py, dx, dy):
-        """Walk from (px,py) in direction (dx,dy) on the inflated map.
-        Return metres of free space before hitting an obstacle / unknown cell."""
-        m = self._occ_map
-        if m is None:
-            return self.avoidance_clearance   # assume free when map not yet received
-        res = m.info.resolution
-        ox  = float(m.info.origin.position.x)
-        oy  = float(m.info.origin.position.y)
-        w   = m.info.width
-        h   = m.info.height
-        dlen = math.hypot(dx, dy) + 1e-9
-        dx /= dlen;  dy /= dlen
-        free = 0.0
-        d    = res
-        max_d = max(self.avoidance_clearance + 0.4, 1.0)  # probe at least 1.0 m
-        while d <= max_d:
-            col = int((px + d * dx - ox) / res)
-            row = int((py + d * dy - oy) / res)
-            if col < 0 or col >= w or row < 0 or row >= h:
-                break
-            val = m.data[row * w + col]
-            if val < 0 or val >= self.map_free_threshold:   # unknown or occupied
-                break
-            free = d
-            d   += res
-        return free
-
     # ── Speed scaling ─────────────────────────────────────────────────────
 
-    def _decide_avoidance_action(self, cx, cy, vlat, vlong, x_map, y_map, vx_map, vy_map):
+    def _decide_avoidance_action(self, cx, cy, vlat, vlong, person_half_w=0.25):
         """Return (obstacle_stop, avoidance_target, early_trigger_dist).
 
-        Avoidance direction is chosen by probing the inflated occupancy map on
-        both sides of the path at the predicted obstacle position, so the car
-        always steers toward free space rather than into walls or the obstacle.
-        Hard-stop is only issued when the obstacle is inside the narrow direct-
-        collision corridor — being beside the car does NOT trigger a stop.
+        avoidance_target is a lateral offset from PATH centre (+ = left, − = right).
+
+        Required separation = car_half + person_half_w + clearance.
+        Uses self._cte (actual car-to-path offset from localization) for the path-frame
+        conversion so the target stays stable even when the car cannot move (e.g. tight curve).
+
+        DIRECTION tiebreaker when person is near centre: side with more available road space
+        (car LEFT of path → more room on right → side=+1 → avoid right).
         """
-        person_approach    = max(0.0, -vlong)
-        early_trigger_dist = self.avoidance_start_dist + person_approach * self.avoidance_predict_t
+        person_approach = max(0.0, -vlong)
 
-        # Hard stop only when object is directly ahead AND the car is not already
-        # committed to avoidance.  Once _avoidance_active is True the car keeps
-        # moving around the obstacle — a momentary cx < stop_dist while the car
-        # is beside the person is expected and should NOT trigger a stop.
-        direct_half_w = self.car_width / 2.0 + 0.10
-        if cx <= self.person_stop_dist and abs(cy) <= direct_half_w and not self._avoidance_active:
-            return True, 0.0, early_trigger_dist
+        # Predicted person position in car frame, then converted to path frame via CTE
+        lat_predicted   = cy + vlat * self.avoidance_predict_t
+        person_path_lat = lat_predicted + self._cte   # + = left of path
 
-        if cx > early_trigger_dist:
-            return False, 0.0, early_trigger_dist
-
-        # Predict future obstacle position in map frame using KF velocity.
-        pred_x = x_map + vx_map * self.avoidance_predict_t
-        pred_y = y_map + vy_map * self.avoidance_predict_t
-
-        # Find the closest reference-path point to the predicted obstacle position
-        # and derive the local path tangent there.
-        px_arr = self.controller.ref_path_x
-        py_arr = self.controller.ref_path_y
-        n = len(px_arr)
-        if n >= 2:
-            ci = int(np.argmin((px_arr - pred_x)**2 + (py_arr - pred_y)**2))
-            if ci + 1 < n:
-                tdx = float(px_arr[ci + 1] - px_arr[ci])
-                tdy = float(py_arr[ci + 1] - py_arr[ci])
-            else:
-                tdx = float(px_arr[ci] - px_arr[ci - 1])
-                tdy = float(py_arr[ci] - py_arr[ci - 1])
-            ref_px, ref_py = float(px_arr[ci]), float(py_arr[ci])
+        # DIRECTION from car frame — stable across whole maneuver
+        CENTERED = 0.35
+        if abs(lat_predicted) > CENTERED:
+            side = math.copysign(1.0, lat_predicted)   # +1 = person LEFT → go right
         else:
-            tdx = math.cos(self.hagen_robot.theta)
-            tdy = math.sin(self.hagen_robot.theta)
-            ref_px, ref_py = self.hagen_robot.x, self.hagen_robot.y
+            # Road-space tiebreaker: go toward the side with more available space
+            side = 1.0 if self._cte >= 0.0 else -1.0
 
-        # Probe the inflated map: left perp = (-tdy, tdx), right perp = (tdy, -tdx).
-        left_clear  = self._map_free_clearance(ref_px, ref_py, -tdy,  tdx)
-        right_clear = self._map_free_clearance(ref_px, ref_py,  tdy, -tdx)
+        # MAGNITUDE: place car so |avoid_dir − person_path_lat| = required_total
+        required_total = self.car_width / 2.0 + person_half_w + self.avoidance_clearance
+        raw_avoid      = person_path_lat - side * required_total
 
-        # Minimum half-gap required on a side before the car attempts to pass.
-        # Below this the car physically cannot fit, so we stop instead.
-        MIN_GAP = self.car_width / 2.0 + 0.10   # 0.30 m
-
-        # Ideal lateral offset: base geometry + speed-based bonus.
-        #
-        # person_approach > 0  → person closing toward car → they'll be more
-        #   central when car arrives → extra clearance proportional to speed.
-        # abs(vlat) > 0        → person crossing into car path → same effect.
-        # Person moving away   → no bonus; base offset is already conservative.
-        #
-        # Coefficients (tunable): 0.30 m per (m/s) approach, 0.20 m per (m/s) lateral.
-        # Hard cap at 1.2 m so the car doesn't try to drive into a wall.
-        base_offset  = max(self.avoidance_clearance,
-                           self.car_width / 2.0 + 0.25 + 0.15)   # ≥ 0.6 m
-        speed_bonus  = person_approach * 0.30 + abs(vlat) * 0.20
-        ideal_offset = min(base_offset + speed_bonus, 1.2)
-
-        def _usable(clear):
-            """Lateral offset achievable given this side's map clearance."""
-            return max(0.0, min(ideal_offset, clear - 0.05))
-
-        lat_predicted = cy + vlat * self.avoidance_predict_t
-        CENTERED      = 0.15   # treat as "centered" if predicted lateral < 15 cm
-
-        # Priority order:
-        #   1. If one side has significantly more map clearance → always go there.
-        #      This prevents the car steering toward a wall just because the person
-        #      is slightly on the other side (the image case: person left, wall right,
-        #      car wrongly went right).
-        #   2. If clearances are similar → go away from person's predicted side.
-        #   3. Tied → prefer left.
-        CLEAR_MARGIN = 0.30   # m: must be this much clearer to override person-side preference
-
-        if left_clear > right_clear + CLEAR_MARGIN:
-            prefer_left = True    # left is clearly roomier — go left regardless of person
-        elif right_clear > left_clear + CLEAR_MARGIN:
-            prefer_left = False   # right is clearly roomier — go right regardless of person
+        # Safety: always go to opposite side, shift at least avoidance_clearance
+        if side * raw_avoid > 0 or abs(raw_avoid) < self.avoidance_clearance:
+            avoid_dir = -side * self.avoidance_clearance
         else:
-            # Similar clearance — use person position to decide direction
-            prefer_left = (lat_predicted < -CENTERED or
-                           (abs(lat_predicted) <= CENTERED and
-                            left_clear >= right_clear))
+            avoid_dir = raw_avoid
 
-        if prefer_left:
-            if left_clear >= MIN_GAP:
-                avoid_dir =  _usable(left_clear)
-            elif right_clear >= MIN_GAP:
-                avoid_dir = -_usable(right_clear)   # forced to opposite side
-            else:
-                return True, 0.0, early_trigger_dist
-        else:
-            if right_clear >= MIN_GAP:
-                avoid_dir = -_usable(right_clear)
-            elif left_clear >= MIN_GAP:
-                avoid_dir =  _usable(left_clear)    # forced to opposite side
-            else:
-                return True, 0.0, early_trigger_dist
+        # Road-limit clamp: never exceed physical road boundary
+        max_avoid = max(0.0, self.lane_half_width - self.car_width / 2.0 - 0.05)
+        avoid_dir = max(-max_avoid, min(max_avoid, avoid_dir))
 
-        # If map clearance is too tiny to matter after the safety margin, just stop.
-        if abs(avoid_dir) < 0.10:
-            return True, 0.0, early_trigger_dist
-
-        # Direction lock: once avoidance is active keep the same steering side
-        # unless the person has clearly crossed past 0.25 m to the other side.
-        # This prevents noisy lat_predicted from flipping avoid_dir every frame,
-        # which keeps avoidance_offset near zero while the ramp chases both signs.
-        if self._avoidance_active and self.avoidance_target != 0.0:
-            prev_sign = math.copysign(1.0, self.avoidance_target)
-            new_sign  = math.copysign(1.0, avoid_dir)
-            if new_sign != prev_sign and abs(lat_predicted) < 0.25:
-                # Person still near-centered — restore the locked side
-                if prev_sign > 0 and left_clear >= MIN_GAP:
-                    avoid_dir =  _usable(left_clear)
-                elif prev_sign < 0 and right_clear >= MIN_GAP:
-                    avoid_dir = -_usable(right_clear)
-                # (if locked side lost clearance, let the flip proceed)
-
-        self.get_logger().warn(
-            f"[AVOID] left_clear={left_clear:.2f}m right_clear={right_clear:.2f}m "
-            f"→ dir={'L' if avoid_dir > 0 else 'R'}({avoid_dir:+.2f}m)",
-            throttle_duration_sec=0.3,
+        # Trigger distance: extend when person is approaching or maneuver needs more space
+        AVOIDANCE_RAMP_SPEED = 0.5
+        remaining_shift    = abs(avoid_dir - self.avoidance_offset)
+        maneuver_dist      = self.person_stop_dist + self.hagen_robot.v * (remaining_shift / AVOIDANCE_RAMP_SPEED)
+        early_trigger_dist = max(
+            self.avoidance_start_dist + person_approach * self.avoidance_predict_t,
+            maneuver_dist,
         )
-        return False, avoid_dir, early_trigger_dist
+
+        if cx <= self.person_stop_dist:
+            collision_half = self.car_width / 2.0 + person_half_w + 0.10
+            if abs(cy) < collision_half:
+                return True, 0.0, early_trigger_dist
+            return False, avoid_dir, early_trigger_dist
+        if cx <= early_trigger_dist:
+            return False, avoid_dir, early_trigger_dist
+        return False, 0.0, early_trigger_dist
 
     def _compute_goal_speed(self, goal_distance):
         if goal_distance < self.goal_slowdown_dist:
@@ -872,7 +727,6 @@ class PurePursuitNode(Node):
         return max(self._base_L_d * 0.5, adaptive)
 
     def _compute_curve_speed(self, delta):
-        # sqrt mapping: speed drops steeply even at small steer angles
         ratio = min(1.0, abs(delta) / STEER_LIMIT) ** 0.5
         return self.command_speed - (self.command_speed - self.min_curve_speed) * ratio
 
@@ -905,12 +759,6 @@ class PurePursuitNode(Node):
     def _compute_safe_speed(self):
         dist = self.closest_person_dist
         if dist == float('inf'):
-            return self.command_speed
-
-        # While actively steering around the person, run at full command speed.
-        # Slowing down here causes the car to nearly stop while beside the obstacle
-        # (cx ≈ 0.5 m triggers the ramp even though the car is already passing).
-        if self._avoidance_active:
             return self.command_speed
 
         # Extend the slowdown zone when person walks toward car.

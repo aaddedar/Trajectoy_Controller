@@ -19,6 +19,7 @@ def generate_launch_description():
                 'avoidance_clearance':  0.3,
                 'avoidance_predict_t':  1.5,
                 'avoidance_start_dist': 1.5,
+                'avoidance_clear_hold': 6.0,
             }],
         ),
     ])

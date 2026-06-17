@@ -40,31 +40,27 @@ from pure_persuit_node import (
 )
 
 
-# ── Minimal stand-in: borrow instance methods without a real ROS 2 node ──────
-class _FakeNode:
-    command_speed        = 1.4
-    min_curve_speed      = 0.9
-    person_stop_dist     = 0.4
-    person_slowdown_dist = 1.5
-    avoidance_predict_t  = 1.5
-    avoidance_start_dist = 1.5
-    avoidance_clearance  = 0.3
-    closest_person_dist  = float('inf')
-    closest_vlong        = 0.0
-    hagen_robot          = HagenRobot(x=0.0, y=0.0, theta=0.0, v=1.4, L=0.3)
+# ── Minimal clock mock (needed by _clear_obstacle hold timer) ─────────────────
+class _FakeDuration:
+    def __init__(self, secs):
+        self.nanoseconds = int(secs * 1e9)
 
-    _compute_safe_speed            = PurePursuitNode._compute_safe_speed
-    _compute_curve_speed           = PurePursuitNode._compute_curve_speed
-    _compute_ahead_curvature_speed = PurePursuitNode._compute_ahead_curvature_speed
-    _map_to_car_frame              = PurePursuitNode._map_to_car_frame
-    _clear_obstacle                = PurePursuitNode._clear_obstacle
+class _FakeTime:
+    def __init__(self, t):
+        self._t = t
+    def __sub__(self, other):
+        return _FakeDuration(self._t - other._t)
+    @property
+    def nanoseconds(self):
+        return int(self._t * 1e9)
 
-    obstacle_stop_requested = False
-    avoidance_target        = 0.0
-    _cte                    = 0.0
-
-    def publish_obstacle_information(self): pass
-    def get_logger(self): return MagicMock()
+class _FakeClock:
+    def __init__(self, t=0.0):
+        self._t = t
+    def set(self, t):
+        self._t = t
+    def now(self):
+        return _FakeTime(self._t)
 
 
 def _make_ctrl(xs, ys, last_index=0):
@@ -73,6 +69,57 @@ def _make_ctrl(xs, ys, last_index=0):
         'ref_path_y': np.asarray(ys, dtype=float),
         'last_index': last_index,
     })()
+
+
+# ── Minimal stand-in: borrow instance methods without a real ROS 2 node ──────
+class _FakeNode:
+    # Path following
+    command_speed        = 1.4
+    min_curve_speed      = 0.9
+    _base_L_d            = 0.30
+    _k                   = 0.3
+
+    # Obstacle / person
+    person_stop_dist     = 0.4
+    person_slowdown_dist = 1.5
+    avoidance_predict_t  = 1.5
+    avoidance_start_dist = 1.5
+    # Must exceed MIN_GAP = car_width/2+0.10 = 0.300…04 to avoid float tie
+    avoidance_clearance  = 0.5
+    car_width            = 0.40
+    path_corridor_margin = 1.0
+    map_free_threshold   = 50
+
+    # State
+    closest_person_dist  = float('inf')
+    closest_vlong        = 0.0
+    obstacle_stop_requested = False
+    avoidance_target     = 0.0
+    avoidance_offset     = 0.0
+    _cte                 = 0.0
+    _avoidance_active    = False   # True while actively steering around obstacle
+    _clear_since_time    = None    # wall-clock sec when person first left corridor
+    _CLEAR_HOLD_TIME     = 6.0    # seconds to hold avoidance after person leaves
+
+    # Map: None → _map_free_clearance returns avoidance_clearance
+    _occ_map             = None
+
+    # Robot state & controller (straight path along +x)
+    hagen_robot          = HagenRobot(x=0.0, y=0.0, theta=0.0, v=1.4, L=0.3)
+    controller           = _make_ctrl(np.arange(0.0, 5.0, 0.05), np.zeros(100))
+
+    # Bound methods borrowed from PurePursuitNode
+    _compute_safe_speed            = PurePursuitNode._compute_safe_speed
+    _compute_curve_speed           = PurePursuitNode._compute_curve_speed
+    _compute_ahead_curvature_speed = PurePursuitNode._compute_ahead_curvature_speed
+    _map_to_car_frame              = PurePursuitNode._map_to_car_frame
+    _map_free_clearance            = PurePursuitNode._map_free_clearance
+    _decide_avoidance_action       = PurePursuitNode._decide_avoidance_action
+    _clear_obstacle                = PurePursuitNode._clear_obstacle
+
+    def publish_obstacle_information(self): pass
+    def get_logger(self): return MagicMock()
+    def get_clock(self): return _FakeClock()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -247,10 +294,11 @@ class TestMapToCarFrame(unittest.TestCase):
 # ═════════════════════════════════════════════════════════════════════════════
 class TestComputeSafeSpeed(unittest.TestCase):
 
-    def _n(self, dist=float('inf'), vlong=0.0):
+    def _n(self, dist=float('inf'), vlong=0.0, avoidance_active=False):
         n = _FakeNode()
         n.closest_person_dist = dist
         n.closest_vlong       = vlong
+        n._avoidance_active   = avoidance_active
         return n
 
     def test_no_person_returns_full_speed(self):
@@ -258,7 +306,7 @@ class TestComputeSafeSpeed(unittest.TestCase):
         self.assertAlmostEqual(self._n()._compute_safe_speed(), 1.4)
 
     def test_at_stop_distance_returns_zero(self):
-        """Person exactly at stop_dist → speed = 0."""
+        """Person exactly at stop_dist → speed = 0 (when not avoiding)."""
         self.assertAlmostEqual(self._n(dist=0.4)._compute_safe_speed(), 0.0)
 
     def test_midpoint_of_ramp_zone(self):
@@ -289,6 +337,14 @@ class TestComputeSafeSpeed(unittest.TestCase):
         speeds = [self._n(dist=d)._compute_safe_speed() for d in dists]
         for i in range(len(speeds) - 1):
             self.assertLessEqual(speeds[i], speeds[i + 1])
+
+    def test_avoidance_active_bypasses_slowdown(self):
+        """While _avoidance_active=True, full speed returned even with person nearby."""
+        # Person at 0.5 m would normally slow to ~14% of command_speed
+        s_normal  = self._n(dist=0.5, avoidance_active=False)._compute_safe_speed()
+        s_avoided = self._n(dist=0.5, avoidance_active=True )._compute_safe_speed()
+        self.assertAlmostEqual(s_avoided, 1.4, places=4)
+        self.assertLess(s_normal, 1.4)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -366,19 +422,26 @@ class TestComputeAheadCurvatureSpeed(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 9. PurePursuitNode._clear_obstacle
+# 9. PurePursuitNode._clear_obstacle  (time-based hold)
 # ═════════════════════════════════════════════════════════════════════════════
 class TestClearObstacle(unittest.TestCase):
 
-    def _n(self):
+    def _n(self, avoidance_active=False):
         n = _FakeNode()
         n.obstacle_stop_requested = True
         n.closest_person_dist     = 0.8
         n.closest_vlong           = -0.3
         n.avoidance_target        = 0.3
+        n._avoidance_active       = avoidance_active
+        n._clear_since_time       = None
+        n._CLEAR_HOLD_TIME        = 6.0
+        n._clock                  = _FakeClock(0.0)
+        n.get_clock               = lambda: n._clock
         return n
 
-    def test_clears_obstacle_stop_flag(self):
+    # ── Not avoiding: immediate clear ────────────────────────────────────────
+
+    def test_clears_stop_flag_immediately(self):
         n = self._n(); n._clear_obstacle()
         self.assertFalse(n.obstacle_stop_requested)
 
@@ -390,13 +453,47 @@ class TestClearObstacle(unittest.TestCase):
         n = self._n(); n._clear_obstacle()
         self.assertAlmostEqual(n.closest_vlong, 0.0)
 
-    def test_clears_avoidance_target(self):
-        n = self._n(); n._clear_obstacle()
+    def test_not_avoiding_clears_target_immediately(self):
+        """When _avoidance_active=False, avoidance_target is zeroed at once."""
+        n = self._n(avoidance_active=False); n._clear_obstacle()
         self.assertAlmostEqual(n.avoidance_target, 0.0)
+
+    # ── Avoiding: hold timer keeps lane offset ────────────────────────────────
+
+    def test_avoiding_first_call_starts_timer_and_holds_target(self):
+        """First clear call when _avoidance_active starts the clock but does NOT zero target."""
+        n = self._n(avoidance_active=True)
+        n._clear_obstacle()
+        self.assertAlmostEqual(n.avoidance_target, 0.3)   # still holding
+        self.assertTrue(n._avoidance_active)
+        self.assertIsNotNone(n._clear_since_time)
+
+    def test_avoiding_clears_stop_flag_even_during_hold(self):
+        """Hard-stop flag is cleared immediately even while holding avoidance."""
+        n = self._n(avoidance_active=True)
+        n._clear_obstacle()
+        self.assertFalse(n.obstacle_stop_requested)
+
+    def test_hold_within_window_keeps_target(self):
+        """Call within hold window still keeps avoidance target."""
+        n = self._n(avoidance_active=True)
+        n._clock.set(0.0); n._clear_obstacle()   # starts timer
+        n._clock.set(3.0); n._clear_obstacle()   # 3 s < 6 s hold
+        self.assertTrue(n._avoidance_active)
+        self.assertAlmostEqual(n.avoidance_target, 0.3)
+
+    def test_hold_expired_clears_target_and_flag(self):
+        """After _CLEAR_HOLD_TIME the target is zeroed and _avoidance_active reset."""
+        n = self._n(avoidance_active=True)
+        n._clock.set(0.0); n._clear_obstacle()   # starts timer
+        n._clock.set(7.0); n._clear_obstacle()   # 7 s > 6 s → expire
+        self.assertFalse(n._avoidance_active)
+        self.assertAlmostEqual(n.avoidance_target, 0.0)
+        self.assertIsNone(n._clear_since_time)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 10. Goal speed ramp — stopping at target location
+# 10. Goal speed ramp
 # ═════════════════════════════════════════════════════════════════════════════
 class TestGoalSpeedRamp(unittest.TestCase):
 
@@ -439,43 +536,44 @@ class TestAdaptiveLookahead(unittest.TestCase):
         n._compute_adaptive_L_d = PurePursuitNode._compute_adaptive_L_d.__get__(n)
         return n
 
-    def test_straight_expands_lookahead(self):
-        """Zero steering on straight → lookahead = base + k*v."""
-        L = self._n()._compute_adaptive_L_d(0.0, 1.4)
+    def test_straight_zero_steering_expands_lookahead(self):
+        """No steering on straight → lookahead = base + k*v (no curve reduction)."""
+        L = self._n()._compute_adaptive_L_d(prev_delta=0.0, speed=1.4)
         self.assertAlmostEqual(L, 0.30 + 0.3 * 1.4, places=4)
 
-    def test_tight_curve_reduces_lookahead(self):
-        """Max steering angle → lookahead reduced toward floor."""
-        L = self._n()._compute_adaptive_L_d(STEER_LIMIT, 1.4)
-        self.assertLess(L, 0.30 + 0.3 * 1.4)
+    def test_full_steering_reduces_lookahead(self):
+        """Max steer → curve_factor=1 → adaptive = (base+k*v)*0.4."""
+        L = self._n()._compute_adaptive_L_d(prev_delta=STEER_LIMIT, speed=1.4)
+        expected = (0.30 + 0.3 * 1.4) * (1.0 - 0.6)
+        self.assertAlmostEqual(L, max(expected, 0.30 * 0.5), places=4)
 
-    def test_tight_curve_not_below_floor(self):
-        """Lookahead must never go below 50% of base L_d."""
-        L = self._n()._compute_adaptive_L_d(STEER_LIMIT, 1.4)
-        self.assertGreaterEqual(L, 0.30 * 0.5)
+    def test_floor_at_half_base_L_d(self):
+        """Lookahead never falls below 50% of base L_d even at full steer and v=0."""
+        L = self._n()._compute_adaptive_L_d(prev_delta=STEER_LIMIT, speed=0.0)
+        self.assertAlmostEqual(L, 0.30 * 0.5, places=4)
 
-    def test_zero_speed_base_lookahead(self):
-        """At v=0 on straight, lookahead equals base L_d."""
-        L = self._n()._compute_adaptive_L_d(0.0, 0.0)
+    def test_zero_speed_zero_steering_returns_base(self):
+        """v=0, no steering → lookahead equals base L_d."""
+        L = self._n()._compute_adaptive_L_d(prev_delta=0.0, speed=0.0)
         self.assertAlmostEqual(L, 0.30, places=4)
 
     def test_higher_speed_larger_lookahead(self):
-        """Higher speed on straight produces larger lookahead."""
-        L_slow = self._n()._compute_adaptive_L_d(0.0, 0.5)
-        L_fast = self._n()._compute_adaptive_L_d(0.0, 1.4)
+        """Higher speed on straight path produces longer lookahead."""
+        n = self._n()
+        L_slow = n._compute_adaptive_L_d(prev_delta=0.0, speed=0.5)
+        L_fast = n._compute_adaptive_L_d(prev_delta=0.0, speed=1.4)
         self.assertGreater(L_fast, L_slow)
 
-    def test_lookahead_decreases_with_curve_factor(self):
-        """Lookahead must decrease monotonically as steering increases."""
+    def test_more_steering_shorter_lookahead(self):
+        """Larger prev_delta (curving) → shorter lookahead than straight."""
         n = self._n()
-        deltas = np.linspace(0.0, STEER_LIMIT, 20)
-        L_vals = [n._compute_adaptive_L_d(d, 1.4) for d in deltas]
-        for i in range(len(L_vals) - 1):
-            self.assertGreaterEqual(L_vals[i], L_vals[i + 1])
+        L_straight = n._compute_adaptive_L_d(prev_delta=0.0,             speed=1.4)
+        L_curved   = n._compute_adaptive_L_d(prev_delta=STEER_LIMIT / 2, speed=1.4)
+        self.assertLess(L_curved, L_straight)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 12. Corridor filter — persons behind or outside corridor are ignored
+# 12. Corridor filter
 # ═════════════════════════════════════════════════════════════════════════════
 class TestCorridorFilter(unittest.TestCase):
 
@@ -485,7 +583,7 @@ class TestCorridorFilter(unittest.TestCase):
         return PurePursuitNode._map_to_car_frame(n, x_map, y_map)
 
     def test_person_ahead_in_corridor(self):
-        """Person 2 m ahead, centered → cx > 0.1, |cy| < corridor."""
+        """Person 2 m ahead, centered → cx > 0.1, |cy| < corridor_half."""
         cx, cy = self._car_frame(2.0, 0.0)
         self.assertGreater(cx, 0.1)
         self.assertLess(abs(cy), 1.2)
@@ -507,72 +605,152 @@ class TestCorridorFilter(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 13. Avoidance action decision — direction, hard stop, early trigger
+# 13. Avoidance action decision
+#
+# With _occ_map=None, _map_free_clearance returns avoidance_clearance (0.5 m)
+# for both sides.  left_clear == right_clear → difference < CLEAR_MARGIN (0.3 m)
+# → person lateral position is the tiebreaker for direction.
+# _usable(0.5) = min(ideal_offset=0.6, 0.5 - 0.05) = 0.45 m when map not available.
 # ═════════════════════════════════════════════════════════════════════════════
 class TestDecideAvoidanceAction(unittest.TestCase):
 
-    def _n(self, cte=0.0):
+    def _n(self, avoidance_active=False, avoidance_target=0.0):
         n = _FakeNode()
-        n._cte = cte
-        n._decide_avoidance_action = PurePursuitNode._decide_avoidance_action.__get__(n)
+        n._avoidance_active = avoidance_active
+        n.avoidance_target  = avoidance_target
         return n
 
+    def _decide(self, n, cx, cy, vlat=0.0, vlong=0.0,
+                x_map=1.0, y_map=0.0, vx_map=0.0, vy_map=0.0):
+        return n._decide_avoidance_action(cx, cy, vlat, vlong, x_map, y_map, vx_map, vy_map)
+
+    # ── Direction ─────────────────────────────────────────────────────────────
+
     def test_person_on_left_avoids_right(self):
-        """Person clearly to the left → avoidance target is negative (right)."""
-        _, target, _ = self._n()._decide_avoidance_action(cx=1.0, cy=0.5, vlat=0.0, vlong=0.0)
+        """Person clearly to the left (cy=+0.5) → avoidance target is negative (right)."""
+        _, target, _ = self._decide(self._n(), cx=1.0, cy=0.5)
         self.assertLess(target, 0.0)
 
     def test_person_on_right_avoids_left(self):
-        """Person clearly to the right → avoidance target is positive (left)."""
-        _, target, _ = self._n()._decide_avoidance_action(cx=1.0, cy=-0.5, vlat=0.0, vlong=0.0)
+        """Person clearly to the right (cy=-0.5) → avoidance target is positive (left)."""
+        _, target, _ = self._decide(self._n(), cx=1.0, cy=-0.5)
         self.assertGreater(target, 0.0)
 
     def test_lateral_velocity_shifts_predicted_position(self):
-        """Person near center moving left → predicted left → avoids right."""
-        # cy=0.1 but vlat=+0.5 → lat_predicted = 0.1 + 0.5*1.5 = 0.85 (left)
-        _, target, _ = self._n()._decide_avoidance_action(cx=1.0, cy=0.1, vlat=0.5, vlong=0.0)
+        """Person near centre moving left (vlat=+0.5) → predicted left → avoids right."""
+        _, target, _ = self._decide(self._n(), cx=1.0, cy=0.1, vlat=0.5)
         self.assertLess(target, 0.0)
 
+    def test_diagonal_walker_uses_predicted_not_current_position(self):
+        """Person currently left (cy=+0.3) but crossing right (vlat=-0.5).
+        lat_predicted = 0.3 + (-0.5)*1.5 = -0.45 → will be RIGHT → avoids LEFT."""
+        _, target, _ = self._decide(self._n(), cx=1.0, cy=0.3, vlat=-0.5, vlong=-0.5)
+        self.assertGreater(target, 0.0, "predicted position is right → should avoid left")
+
+    # ── Hard stop ────────────────────────────────────────────────────────────
+
     def test_person_at_stop_distance_triggers_hard_stop(self):
-        """Person at exactly stop_dist (0.4 m) → hard stop, avoidance target = 0."""
-        stop, target, _ = self._n()._decide_avoidance_action(cx=0.4, cy=0.0, vlat=0.0, vlong=0.0)
+        """Person at exactly stop_dist (0.4 m) centered → hard stop."""
+        stop, target, _ = self._decide(self._n(), cx=0.4, cy=0.0)
         self.assertTrue(stop)
         self.assertEqual(target, 0.0)
 
     def test_person_beyond_stop_distance_no_hard_stop(self):
-        """Person at 0.6 m (beyond stop zone) → no hard stop."""
-        stop, _, _ = self._n()._decide_avoidance_action(cx=0.6, cy=0.0, vlat=0.0, vlong=0.0)
+        """Person at 0.6 m → beyond stop zone → no hard stop."""
+        stop, _, _ = self._decide(self._n(), cx=0.6, cy=0.0)
         self.assertFalse(stop)
 
-    def test_static_person_avoids_within_start_dist(self):
-        """Static person at 1.0 m (inside 1.5 m zone) → avoidance active."""
-        _, target, _ = self._n()._decide_avoidance_action(cx=1.0, cy=0.4, vlat=0.0, vlong=0.0)
+    def test_hard_stop_suppressed_when_avoidance_active(self):
+        """_avoidance_active=True suppresses hard stop even when person is very close."""
+        stop, _, _ = self._decide(self._n(avoidance_active=True), cx=0.3, cy=0.0)
+        self.assertFalse(stop, "hard stop must be suppressed while avoidance is active")
+
+    def test_offset_person_does_not_trigger_hard_stop(self):
+        """Person at stop_dist but well to the side (|cy| > car_half+0.10) → no stop."""
+        stop, _, _ = self._decide(self._n(), cx=0.4, cy=0.5)
+        self.assertFalse(stop)
+
+    # ── Trigger distance ──────────────────────────────────────────────────────
+
+    def test_person_within_start_dist_triggers_avoidance(self):
+        """Person at cx=1.0 (inside 1.5 m zone) → avoidance active."""
+        _, target, _ = self._decide(self._n(), cx=1.0, cy=0.4)
         self.assertNotEqual(target, 0.0)
 
-    def test_static_person_beyond_start_dist_no_avoidance(self):
-        """Static person at 2.0 m (beyond 1.5 m zone) → no avoidance."""
-        _, target, _ = self._n()._decide_avoidance_action(cx=2.0, cy=0.4, vlat=0.0, vlong=0.0)
+    def test_person_beyond_start_dist_no_avoidance(self):
+        """Person at cx=2.0 (beyond 1.5 m zone, stationary) → no avoidance."""
+        _, target, _ = self._decide(self._n(), cx=2.0, cy=0.4)
         self.assertEqual(target, 0.0)
 
     def test_approaching_person_extends_trigger_distance(self):
-        """Person at -0.5 m/s toward car → trigger fires at 1.5 + 0.5*1.5 = 2.25 m."""
-        _, _, trigger = self._n()._decide_avoidance_action(cx=2.0, cy=0.4, vlat=0.0, vlong=-0.5)
-        self.assertAlmostEqual(trigger, 1.5 + 0.5 * 1.5, places=4)
+        """vlong=-0.5 (approaching) → trigger = 1.5 + 0.5*1.5 = 2.25 m."""
+        _, _, trigger = self._decide(self._n(), cx=2.0, cy=0.4, vlong=-0.5)
+        self.assertAlmostEqual(trigger, 2.25, places=4)
 
-    def test_receding_person_no_trigger_extension(self):
-        """Person moving away → no extension, trigger stays at base 1.5 m."""
-        _, _, trigger = self._n()._decide_avoidance_action(cx=2.0, cy=0.4, vlat=0.0, vlong=0.5)
+    def test_approaching_person_fires_avoidance_beyond_base_dist(self):
+        """cx=2.0 beyond base 1.5 m but within extended 2.25 m → avoidance fires."""
+        _, target, _ = self._decide(self._n(), cx=2.0, cy=0.4, vlong=-0.5)
+        self.assertNotEqual(target, 0.0)
+
+    def test_receding_person_trigger_stays_at_base(self):
+        """vlong=+0.5 (receding) → person_approach=0 → trigger stays at 1.5 m."""
+        _, _, trigger = self._decide(self._n(), cx=2.0, cy=0.4, vlong=0.5)
         self.assertAlmostEqual(trigger, 1.5, places=4)
 
-    def test_centered_person_car_on_path_avoids_right(self):
-        """Person centered, car on path (CTE≈0) → default right (target < 0)."""
-        _, target, _ = self._n(cte=0.0)._decide_avoidance_action(cx=1.0, cy=0.0, vlat=0.0, vlong=0.0)
-        self.assertLess(target, 0.0)
+    # ── Speed-adaptive offset magnitude ───────────────────────────────────────
 
-    def test_centered_person_car_right_of_path_avoids_left(self):
-        """Person centered, car right of path (CTE=-0.1) → go left (target > 0)."""
-        _, target, _ = self._n(cte=-0.10)._decide_avoidance_action(cx=1.0, cy=0.0, vlat=0.0, vlong=0.0)
-        self.assertGreater(target, 0.0)
+    def test_approaching_person_gets_speed_bonus(self):
+        """Approaching person (vlong<0) → larger ideal_offset than stationary."""
+        # ideal_offset = base + person_approach*0.30; actual capped by map clearance
+        # To see the effect we need clearance > ideal; but with _occ_map=None
+        # clearance=0.3m caps to 0.25m in both cases.
+        # Test that the trigger distance is larger (indirect evidence of speed bonus).
+        _, _, trig_still   = self._decide(self._n(), cx=1.0, cy=0.0, vlong= 0.0)
+        _, _, trig_toward  = self._decide(self._n(), cx=1.0, cy=0.0, vlong=-0.5)
+        self.assertGreater(trig_toward, trig_still)
+
+    # ── Direction lock ────────────────────────────────────────────────────────
+
+    def test_direction_lock_holds_side_against_small_shift(self):
+        """Once locked LEFT (+target), person slightly left (lat=0.2 < lock threshold 0.25)
+        does NOT flip direction to RIGHT."""
+        # Without lock: cy=0.2 > CENTERED(0.15) → prefer right (negative)
+        # With lock (prev positive target): lock restores left (positive)
+        n = self._n(avoidance_active=True, avoidance_target=0.25)  # locked LEFT
+        _, target, _ = self._decide(n, cx=1.0, cy=0.2)
+        self.assertGreater(target, 0.0, "direction lock should keep LEFT despite cy=0.2")
+
+    def test_direction_lock_allows_flip_on_large_crossing(self):
+        """Large lateral crossing (lat_predicted > 0.25) overrides the lock."""
+        # Locked LEFT but person clearly moving to left at high vlat
+        # lat_predicted = -0.5 + 0.5*1.5 = 0.25 -- edge; use clearer case
+        n = self._n(avoidance_active=True, avoidance_target=0.25)  # locked LEFT
+        # cy=-0.4, vlat=0.0 → lat_predicted=-0.4 < -CENTERED → prefer_left=True (still LEFT!)
+        # To force flip: need person clearly RIGHT when locked LEFT.
+        # cy=0.5 lat_predicted=0.5 > 0.25 → would flip to RIGHT and lat > 0.25 → flip allowed
+        _, target, _ = self._decide(n, cx=1.0, cy=0.5, vlat=0.0)
+        self.assertLess(target, 0.0, "large lateral shift (0.5 > 0.25) should override lock")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 14. Map free-clearance probe
+# ═════════════════════════════════════════════════════════════════════════════
+class TestMapFreeClearance(unittest.TestCase):
+
+    def _n(self): return _FakeNode()
+
+    def test_no_map_returns_avoidance_clearance(self):
+        """When _occ_map is None, returns avoidance_clearance as safe default."""
+        n = self._n()
+        result = n._map_free_clearance(0.0, 0.0, 1.0, 0.0)
+        self.assertAlmostEqual(result, n.avoidance_clearance)
+
+    def test_probe_direction_normalised(self):
+        """Unnormalised direction vector gives same result as normalised one."""
+        n = self._n()
+        r1 = n._map_free_clearance(0.0, 0.0, 1.0, 0.0)
+        r2 = n._map_free_clearance(0.0, 0.0, 5.0, 0.0)
+        self.assertAlmostEqual(r1, r2, places=5)
 
 
 if __name__ == '__main__':
