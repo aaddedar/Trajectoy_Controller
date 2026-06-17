@@ -59,8 +59,6 @@ The trajectory controller shall subscribe to the following ROS 2 topics:
 | `/tracked_objects` | `Detection3DArray` | BEST\_EFFORT | KF-tracked persons with velocity |
 | `/map` | `OccupancyGrid` | TRANSIENT\_LOCAL | Inflated static map for avoidance direction probing |
 
-> **Note:** `/traffic_decision` and `/robot_description` are **not** subscribed.
-> The person-detection topic is `/tracked_objects`, not `/objects_in_map_frame`.
 
 **Verified:** all six topics subscribed on node startup. ✅
 
@@ -75,8 +73,6 @@ Speed control is **open-loop** — `/ackermann_drive_feedback` is received but n
 closed-loop feedback signal. No steady-state error guarantee applies without encoder-based
 closed-loop speed control on the motor driver.
 
-**Verified:** `command_speed = 1.4 m/s` (launch parameter); feedback callback logs only. ✅
-
 ---
 
 #### AC04 — Steering on straight segments
@@ -86,7 +82,6 @@ segment of `/path` in the absence of localization noise. No hard ±2° limit is 
 software; the steering saturates at **±30°** (`STEER_LIMIT`). An adaptive EMA filter
 (`α = 0.75` on normal driving) damps micro-corrections on straight sections.
 
-**Verified:** EMA applied every tick; STEER\_LIMIT = 0.5236 rad. ✅
 
 ---
 
@@ -94,8 +89,6 @@ software; the steering saturates at **±30°** (`STEER_LIMIT`). An adaptive EMA 
 
 The trajectory controller shall publish driving commands on `/ackermann_drive` at **30 Hz**
 (`Ts = 1/30 s`).
-
-**Verified:** `self.Ts = 1.0 / 30.0`; timer created at node startup. ✅
 
 ---
 
@@ -114,8 +107,6 @@ Additional speed behaviour:
 - Both speed reduction and hard stop are **suppressed** while `_avoidance_active = True` so
   the car passes alongside an obstacle rather than stopping beside it
 
-**Verified:** `publish_stop_command()` (speed=0.0) called on both conditions above. ✅
-
 ---
 
 #### AC07 — Stale or missing topic handling
@@ -130,7 +121,6 @@ The trajectory controller shall publish a command with target velocity **0 m/s**
 > **Limitation:** `/ackermann_drive_feedback` staleness is **not** monitored. The node does not
 > stop if feedback is absent or outdated.
 
-**Verified:** guards checked at the top of `control_loop()` before any motion command. ✅
 
 ---
 
@@ -152,8 +142,6 @@ corridor:
 
 All other detections are silently ignored.
 
-**Verified:** `_is_person()` filters class\_id; corridor check in `objects_in_map_frame_callback()`. ✅
-
 ---
 
 #### AC02 — Velocity-adjusted distances
@@ -168,8 +156,6 @@ person_approach     = max(0, −person_vlong)
 effective_slow_dist = person_slowdown_dist + person_approach × avoidance_predict_t
 early_trigger_dist  = avoidance_start_dist + person_approach × avoidance_predict_t
 ```
-
-**Verified:** `_compute_safe_speed()` and `_decide_avoidance_action()`. ✅
 
 ---
 
@@ -186,7 +172,6 @@ cmd_speed = command_speed × factor
 Speed reduction is **bypassed** while `_avoidance_active = True` — the car runs at full
 `command_speed` while steering around a person to avoid stopping beside them.
 
-**Verified:** `_compute_safe_speed()` lines 921–926; bypass at lines 913–914. ✅
 
 ---
 
@@ -197,7 +182,6 @@ when a person's longitudinal distance is ≤ `person_stop_dist` (default 0.4 m) 
 `_avoidance_active = False`. When `_avoidance_active = True` the hard stop is suppressed so
 the car passes alongside the person rather than stopping beside them.
 
-**Verified:** hard-stop guard in `_decide_avoidance_action()`; suppressed when `_avoidance_active`. ✅
 
 ---
 
@@ -223,7 +207,6 @@ obstacle position) the car steers toward the roomier side regardless of where th
 > The tiebreaker for centered persons is **map clearance**, not CTE — CTE does not indicate
 > whether a wall is on that side.
 
-**Verified:** `_decide_avoidance_action()` — `CENTERED = 0.15`, `CLEAR_MARGIN = 0.30`. ✅
 
 ---
 
@@ -244,7 +227,6 @@ RAMP_DOWN = 0.15 / 30 m per tick  →  back to path in ≈ 4 s   (gradual)
 > 0.5/30 m per tick. The implementation uses **2.0/30 ramp-up** (safety-critical, fast
 > response) and **0.15/30 ramp-down** (prevents snap-back before the person has fully passed).
 
-**Verified:** `control_loop()` — `RAMP_UP = 2.0/30.0`, `RAMP_DOWN = 0.15/30.0`. ✅
 
 ---
 
@@ -266,9 +248,6 @@ always have the current stop state.
 > publishes continuously while a person is visible; 5 s would keep the car stopped long after
 > the person has moved away. The full avoidance state (`_avoidance_active`, `avoidance_target`)
 > is also reset on timeout, which was not mentioned in the original AC.
-
-**Verified:** `_check_obstacle_timeout()` — `obstacle_timeout = 1.0`; `publish_obstacle_information()`
-called after every detection update and timeout clear. ✅
 
 ---
 
