@@ -41,8 +41,6 @@ path with real-time obstacle avoidance capabilities.
 The trajectory controller shall compute steering and target velocity commands from
 `/path` and `/kinematic_state` and publish them on `/ackermann_drive`.
 
-**Verified:** subscribes `/path` (TRANSIENT\_LOCAL), `/kinematic_state` (BEST\_EFFORT);
-publishes `AckermannDrive` on `/ackermann_drive` at every control tick. ✅
 
 ---
 
@@ -60,7 +58,6 @@ The trajectory controller shall subscribe to the following ROS 2 topics:
 | `/map` | `OccupancyGrid` | TRANSIENT\_LOCAL | Inflated static map for avoidance direction probing |
 
 
-**Verified:** all six topics subscribed on node startup. ✅
 
 ---
 
