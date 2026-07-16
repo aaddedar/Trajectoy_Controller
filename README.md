@@ -21,8 +21,8 @@ path with real-time obstacle avoidance capabilities.
 - Direction lock prevents oscillation once avoidance side is committed
 - Time-based avoidance hold: car stays offset for 6 s + 4 s ramp after person leaves corridor
 - Full speed maintained during active avoidance (slowdown suppressed while passing)
-- Hard stop suppressed while `_avoidance_active` — car does not stop beside the obstacle
-- Goal approach speed ramp — stops within 2 cm of target
+- Hard stop suppressed while `_avoidance_active` car does not stop beside the obstacle
+- Goal approach speed ramp - stops within 2 cm of target
 - Safety interlock system with external stop signals
 - 30 Hz control loop
 - Ackermann steering model support
@@ -31,12 +31,12 @@ path with real-time obstacle avoidance capabilities.
 
 ## Requirements
 
-### US1.2 — Path Following
+### US1.2 - Path Following
 
 > **As a trajectory controller, I want the robot to follow straight and curved paths,
 > so that motion is stable and predictable.**
 
-#### AC01 — Command computation and output
+#### AC01 - Command computation and output
 
 The trajectory controller shall compute steering and target velocity commands from
 `/path` and `/kinematic_state` and publish them on `/ackermann_drive`.
@@ -44,7 +44,7 @@ The trajectory controller shall compute steering and target velocity commands fr
 
 ---
 
-#### AC02 — Required subscriptions
+#### AC02 - Required subscriptions
 
 The trajectory controller shall subscribe to the following ROS 2 topics:
 
@@ -61,18 +61,18 @@ The trajectory controller shall subscribe to the following ROS 2 topics:
 
 ---
 
-#### AC03 — Target velocity
+#### AC03 - Target velocity
 
 The trajectory controller shall command a target velocity of **1.4 m/s** on `/ackermann_drive`
 when following straight, unobstructed segments of `/path`.
 
-Speed control is **open-loop** — `/ackermann_drive_feedback` is received but not used as a
+Speed control is **open-loop** - `/ackermann_drive_feedback` is received but not used as a
 closed-loop feedback signal. No steady-state error guarantee applies without encoder-based
 closed-loop speed control on the motor driver.
 
 ---
 
-#### AC04 — Steering on straight segments
+#### AC04 - Steering on straight segments
 
 The trajectory controller shall produce near-zero steering commands when following a straight
 segment of `/path` in the absence of localization noise. No hard ±2° limit is enforced in
@@ -82,14 +82,14 @@ software; the steering saturates at **±30°** (`STEER_LIMIT`). An adaptive EMA 
 
 ---
 
-#### AC05 — Control loop rate
+#### AC05 - Control loop rate
 
 The trajectory controller shall publish driving commands on `/ackermann_drive` at **30 Hz**
 (`Ts = 1/30 s`).
 
 ---
 
-#### AC06 — Safety stop conditions
+#### AC06 - Safety stop conditions
 
 The trajectory controller shall publish a command with target velocity **0 m/s** on
 `/ackermann_drive` if any of the following conditions is true:
@@ -106,7 +106,7 @@ Additional speed behaviour:
 
 ---
 
-#### AC07 — Stale or missing topic handling
+#### AC07 - Stale or missing topic handling
 
 The trajectory controller shall publish a command with target velocity **0 m/s** on
 `/ackermann_drive` if any of the following is true:
@@ -118,14 +118,14 @@ The trajectory controller shall publish a command with target velocity **0 m/s**
 
 ---
 
-### US3.9 — Tracked Object Response
+### US3.9 - Tracked Object Response
 
 > **As a trajectory controller, I want to receive tracked objects from the object tracker
 > component and respond with progressive speed reduction, lateral avoidance steering, or a
 > full stop based on their distance and movement, so that the robot navigates safely around
 > people without unnecessary interruptions to reaching its target location.**
 
-#### AC01 — Detection input and corridor filter
+#### AC01 - Detection input and corridor filter
 
 The trajectory controller shall subscribe to `/tracked_objects` (QoS: BEST\_EFFORT) and
 process only detections where `class_id` is `'person'` or `'1'`, located within the forward
@@ -138,11 +138,11 @@ All other detections are silently ignored.
 
 ---
 
-#### AC02 — Velocity-adjusted distances
+#### AC02 - Velocity-adjusted distances
 
 The trajectory controller shall extend both the speed-reduction distance and the avoidance
 trigger distance by `max(0, −person_vlong) × avoidance_predict_t` when the person is moving
-toward the robot. Only the person's **longitudinal velocity** is used — the car's own velocity
+toward the robot. Only the person's **longitudinal velocity** is used - the car's own velocity
 is excluded to prevent stop/accelerate oscillation.
 
 ```
@@ -153,7 +153,7 @@ early_trigger_dist  = avoidance_start_dist + person_approach × avoidance_predic
 
 ---
 
-#### AC03 — Progressive speed reduction
+#### AC03 - Progressive speed reduction
 
 The trajectory controller shall reduce speed linearly from `command_speed` to `0 m/s` as the
 person's distance decreases from `effective_slow_dist` to `person_stop_dist`:
@@ -163,13 +163,13 @@ factor    = (dist − person_stop_dist) / (effective_slow_dist − person_stop_d
 cmd_speed = command_speed × factor
 ```
 
-Speed reduction is **bypassed** while `_avoidance_active = True` — the car runs at full
+Speed reduction is **bypassed** while `_avoidance_active = True` - the car runs at full
 `command_speed` while steering around a person to avoid stopping beside them.
 
 
 ---
 
-#### AC04 — Full stop
+#### AC04 - Full stop
 
 The trajectory controller shall command **0 m/s** and set `obstacle_stop_requested = True`
 when a person's longitudinal distance is ≤ `person_stop_dist` (default 0.4 m) **and**
@@ -179,16 +179,16 @@ the car passes alongside the person rather than stopping beside them.
 
 ---
 
-#### AC05 — Lateral avoidance direction
+#### AC05 - Lateral avoidance direction
 
 The trajectory controller shall activate lateral avoidance when the person's distance is between
 `person_stop_dist` and `early_trigger_dist`. Direction is selected in priority order:
 
-**Step 1 — Map clearance dominates:** if one side of the path has ≥ 0.30 m more free space
+**Step 1 - Map clearance dominates:** if one side of the path has ≥ 0.30 m more free space
 (probed on the inflated OccupancyGrid perpendicular to the path tangent at the predicted
 obstacle position) the car steers toward the roomier side regardless of where the person is.
 
-**Step 2 — Person position tiebreaker** (both sides within 0.30 m of each other):
+**Step 2 - Person position tiebreaker** (both sides within 0.30 m of each other):
 
 | Predicted lateral position `lat_predicted = cy + vlat × predict_t` | Direction |
 |---|---|
@@ -197,7 +197,7 @@ obstacle position) the car steers toward the roomier side regardless of where th
 
 ---
 
-#### AC06 — Avoidance offset ramp rates
+#### AC06 - Avoidance offset ramp rates
 
 The lateral offset ramps using **asymmetric rates** to reach full offset quickly and return
 to path gradually:
@@ -210,14 +210,14 @@ RAMP_DOWN = 0.15 / 30 m per tick  →  back to path in ≈ 4 s   (gradual)
 `RAMP_DOWN` applies only when `avoidance_target = 0` (person cleared). Direction changes use
 `RAMP_UP` in both directions.
 
-> **Note — correction to original AC06:** The original specified a single symmetric rate of
+> **Note - correction to original AC06:** The original specified a single symmetric rate of
 > 0.5/30 m per tick. The implementation uses **2.0/30 ramp-up** (safety-critical, fast
 > response) and **0.15/30 ramp-down** (prevents snap-back before the person has fully passed).
 
 
 ---
 
-#### AC07 — Detection timeout and state reset
+#### AC07 - Detection timeout and state reset
 
 If no `/tracked_objects` message is received for **1 second** (`obstacle_timeout`) while any
 obstacle state is active, the trajectory controller shall reset all obstacle state and resume
@@ -235,23 +235,23 @@ always have the current stop state.
 
 ## Development History
 
-### Phase 1 — Basic Path Following (v1.0 – v2.0)
+### Phase 1 - Basic Path Following (v1.0 – v2.0)
 - Implemented pure pursuit algorithm with bicycle model kinematics
 - Added curvature-adaptive lookahead: shorter `L_d` on curves prevents overshoot
 - Added sqrt curve-speed mapping: drops speed more steeply on curves to tighten turns
 - Goal approach ramp: linear deceleration to zero over last 0.5 m
 
-### Phase 2 — Camera Pipeline and Obstacle Avoidance (v3.0)
+### Phase 2 - Camera Pipeline and Obstacle Avoidance (v3.0)
 - Integrated DetectNet → 3D localizer → Kalman Filter tracker pipeline
 - Lookahead-point offset method: shifts pure-pursuit waypoint laterally to steer around persons
 - Avoidance direction derived from predicted lateral position (`vlat × predict_t`)
 - Hard stop at 0.4 m; slowdown from 1.5 m
 
-### Phase 3 — Avoidance Robustness (v4.0)
+### Phase 3 - Avoidance Robustness (v4.0)
 - Curvature-adaptive `L_d` prevents wide turns at speed
 - Obstacle timeout: resumes after 1.0 s with no detections
 
-### Phase 4 — Avoidance Correctness and Stability (current)
+### Phase 4 - Avoidance Correctness and Stability (current)
 
 **Path following fixes:**
 - Fixed lookahead double-count bug (`LF` was computing `k×v` twice; now `LF = L_d` as already adaptive)
@@ -267,7 +267,7 @@ always have the current stop state.
 **Map-capped adaptive avoidance offset:**
 - `ideal_offset = max(avoidance_clearance, car_width/2 + 0.40 m) + speed_bonus`
 - `speed_bonus = person_approach × 0.30 + |vlat| × 0.20` (larger offset when person moves toward car or crosses laterally; capped at 1.2 m total)
-- Actual commanded offset `= min(ideal_offset, map_clearance − 0.05 m)` — car uses all available corridor space without hitting walls
+- Actual commanded offset `= min(ideal_offset, map_clearance − 0.05 m)` - car uses all available corridor space without hitting walls
 
 **Direction lock:**
 - Once avoidance side is committed, the sign of `avoidance_target` is locked
@@ -282,8 +282,8 @@ always have the current stop state.
 - Asymmetric ramp: fast ramp-up (0.3 s to full offset), slow ramp-down (≈ 4 s back to path)
 
 **Stop logic fixes:**
-- Hard stop suppressed while `_avoidance_active` — car passes beside person rather than stopping next to them
-- Speed limiter (`_compute_safe_speed`) returns `command_speed` during active avoidance — prevents near-zero speed while alongside person
+- Hard stop suppressed while `_avoidance_active` - car passes beside person rather than stopping next to them
+- Speed limiter (`_compute_safe_speed`) returns `command_speed` during active avoidance - prevents near-zero speed while alongside person
 
 ---
 
@@ -304,10 +304,10 @@ L_f = (L_d + k × |v|) × (1 − 0.6 × c),   floored at L_d × 0.5
 ```
 
 Where:
-- `L_d = 0.30` m — base look-ahead distance
-- `k = 0.3` — velocity gain coefficient
-- `v` — current robot velocity (m/s)
-- `c = min(1, |δ_prev| / δ_max)` — curvature factor from previous steering angle
+- `L_d = 0.30` m - base look-ahead distance
+- `k = 0.3` - velocity gain coefficient
+- `v` - current robot velocity (m/s)
+- `c = min(1, |δ_prev| / δ_max)` - curvature factor from previous steering angle
 
 **Curvature-adaptive behaviour:**
 
@@ -327,9 +327,9 @@ Using the Ackermann steering kinematic model:
 ```
 
 Where:
-- `L = 0.30` m — vehicle wheelbase
-- `α` — angle from car heading to lookahead point
-- `ε = 1×10⁻⁵` — numerical stability guard
+- `L = 0.30` m - vehicle wheelbase
+- `α` - angle from car heading to lookahead point
+- `ε = 1×10⁻⁵` - numerical stability guard
 
 #### 3. Steering Smoothing (Adaptive EMA)
 
@@ -338,8 +338,8 @@ EMA weight adapts to driving mode to balance smoothness vs. avoidance response:
 ```
 smoothed_delta = α × prev + (1 − α) × raw
 
-α = 0.75   (normal driving — suppresses micro-corrections on straights)
-α = 0.50   (avoidance active — faster response to steer around obstacle)
+α = 0.75   (normal driving - suppresses micro-corrections on straights)
+α = 0.50   (avoidance active - faster response to steer around obstacle)
 ```
 
 #### 4. Avoidance Offset Ramp
@@ -398,7 +398,7 @@ Scans next 30 path points (~1.5 m ahead) and pre-brakes before curves are reache
 
 ### 3. Safe speed (obstacle distance)
 
-Bypassed entirely when `_avoidance_active = True` — car runs at `command_speed` while passing alongside an obstacle. Only active during approach (before avoidance engages) and after avoidance is fully cleared.
+Bypassed entirely when `_avoidance_active = True` - car runs at `command_speed` while passing alongside an obstacle. Only active during approach (before avoidance engages) and after avoidance is fully cleared.
 
 ```
 v_safe = 0                                              if d ≤ d_stop
@@ -432,7 +432,7 @@ model-predictive approaches. The rationale:
 
 | Approach | Why not used |
 |---|---|
-| **Deep learning (RL / imitation)** | Requires large training data and a calibrated simulator. Behaviour is a black box — unsafe on physical hardware without extensive validation. |
+| **Deep learning (RL / imitation)** | Requires large training data and a calibrated simulator. Behaviour is a black box - unsafe on physical hardware without extensive validation. |
 | **Model Predictive Control (MPC)** | Requires an accurate dynamic model and solves an optimisation at every 33 ms tick. Too computationally expensive for Jetson; vehicle dynamics are not well characterised. |
 | **Dynamic Window Approach / VFH** | Requires a 2-D occupancy grid costmap with moving-obstacle inflation. We have a single 3-D bounding box from the KF tracker, not a full costmap. |
 | **RRT / A\* replanning** | Replanning at 30 Hz is expensive and requires a map with inflation around moving obstacles. |
@@ -448,11 +448,11 @@ Detection → Predict position → Probe map → Choose roomier side → Cap off
 2. **Constant Velocity Model (CVM)** predicts future position over `avoidance_predict_t = 1.5 s`:
    `pred = (x_map + vx_map × predict_t, y_map + vy_map × predict_t)`
    The KF tracker smooths the velocity estimate; this node assumes constant velocity over the horizon.
-   No acceleration model is used — at typical walking speeds (≤ 1.5 m/s) over 1.5 s the error is small.
+   No acceleration model is used - at typical walking speeds (≤ 1.5 m/s) over 1.5 s the error is small.
 3. Closest path point to predicted position found; path tangent computed there.
 4. Inflated OccupancyGrid probed in left and right perpendicular directions (up to 1.0 m).
 5. Direction chosen by map clearance (roomier side preferred); person position used only as tiebreaker.
-6. Commanded offset: `_usable(clear) = min(ideal_offset, clear − 0.05 m)` — uses all available corridor width.
+6. Commanded offset: `_usable(clear) = min(ideal_offset, clear − 0.05 m)` - uses all available corridor width.
 7. Lookahead point shifted perpendicularly; pure pursuit steers toward it.
 
 ### Avoidance Offset Formula
@@ -476,10 +476,10 @@ has already moved partway toward the avoidance target, avoiding over-correction.
 | Person state | `ideal_offset` | Effect |
 |---|---|---|
 | Stationary | 0.60 m | Baseline |
-| Approaching at 0.5 m/s | 0.75 m | More room needed — they'll be central at arrival |
+| Approaching at 0.5 m/s | 0.75 m | More room needed - they'll be central at arrival |
 | Approaching at 1.0 m/s | 0.90 m | Higher urgency |
 | Crossing at 0.5 m/s | 0.70 m | Lateral bonus |
-| Moving away | 0.60 m | No bonus — they're clearing |
+| Moving away | 0.60 m | No bonus - they're clearing |
 
 ### Direction Selection
 
@@ -487,9 +487,9 @@ has already moved partway toward the avoidance target, avoiding over-correction.
 left_clear, right_clear  ← map probe at predicted obstacle position
 
 if left_clear > right_clear + 0.30 m:
-    go LEFT   (map dominates — ignore person side)
+    go LEFT   (map dominates - ignore person side)
 elif right_clear > left_clear + 0.30 m:
-    go RIGHT  (map dominates — ignore person side)
+    go RIGHT  (map dominates - ignore person side)
 else:
     go AWAY from person's predicted lateral position  (tiebreaker)
     if person centered (|lat_predicted| < 0.15 m): go to roomier side
@@ -497,7 +497,7 @@ else:
 
 Once a direction is committed while `_avoidance_active`, the side is **locked**. It only changes if
 the person's predicted lateral position crosses > 0.25 m to the other side AND that side has map
-clearance — prevents noisy `lat_predicted` from flipping direction every frame.
+clearance - prevents noisy `lat_predicted` from flipping direction every frame.
 
 ### State Machine
 
@@ -517,8 +517,8 @@ trigger_dist = avoidance_start_dist + person_approach × avoidance_predict_t
 ```
 
 > **Note on timeouts:**
-> - *Obstacle timeout* (1.0 s): clears stale detection when tracker loses person entirely — resets all avoidance state
-> - *Clear hold timer* (`avoidance_clear_hold`, 6.0 s): keeps lateral offset after person leaves corridor — prevents snap-back while passing alongside
+> - *Obstacle timeout* (1.0 s): clears stale detection when tracker loses person entirely - resets all avoidance state
+> - *Clear hold timer* (`avoidance_clear_hold`, 6.0 s): keeps lateral offset after person leaves corridor - prevents snap-back while passing alongside
 > - These are independent mechanisms serving different failure modes
 
 ---
@@ -533,7 +533,7 @@ trigger_dist = avoidance_start_dist + person_approach × avoidance_predict_t
 | Launch command | `ros2 launch control_car pure_persuit.launch.py` |
 | Control loop | 30 Hz |
 
-> **Note:** The filename `pure_persuit.launch.py` is intentional — it matches the file on disk.
+> **Note:** The filename `pure_persuit.launch.py` is intentional - it matches the file on disk.
 
 ### Publishers
 
@@ -574,7 +574,7 @@ Published by the KF tracker. Fields used by this node:
 | Field | Meaning |
 |---|---|
 | `bbox.center.position.x/y` | Map-frame position of person |
-| `results[0].hypothesis.class_id` | Label — must be `"person"` or `"1"` |
+| `results[0].hypothesis.class_id` | Label - must be `"person"` or `"1"` |
 | `results[0].pose.pose.position.x/y` | Map-frame velocity (vx, vy) from KF state |
 
 ### Expected TF Frames
@@ -584,7 +584,7 @@ Published by the KF tracker. Fields used by this node:
 | `map` | Global reference frame for path, localization, and `/map` |
 | `base_link` | Robot body frame |
 
-The node does not perform TF lookups directly — pose is received via `/kinematic_state`.
+The node does not perform TF lookups directly - pose is received via `/kinematic_state`.
 
 ---
 
@@ -602,8 +602,8 @@ ros2 param set /pure_pursuit_node <param> <value>
 | `command_speed` | 1.4 | m/s | Maximum forward speed |
 | `min_curve_speed` | 0.9 | m/s | Minimum speed in tight curves |
 | `L_d` | 0.30 | m | Base look-ahead distance |
-| `k` | 0.3 | — | Velocity gain for adaptive lookahead |
-| `invert_steering` | False | — | Negate steering output (mirror installation) |
+| `k` | 0.3 | - | Velocity gain for adaptive lookahead |
+| `invert_steering` | False | - | Negate steering output (mirror installation) |
 
 ### Obstacle Safety
 
@@ -615,7 +615,7 @@ ros2 param set /pure_pursuit_node <param> <value>
 | `avoidance_clearance` | 0.3 | m | Minimum extra lateral gap beyond car + 0.40 m |
 | `avoidance_predict_t` | 1.5 | s | KF velocity prediction horizon |
 | `avoidance_clear_hold` | 6.0 | s | Hold offset after person leaves corridor before returning to path |
-| `map_topic` | `/map` | — | OccupancyGrid topic for free-space probing |
+| `map_topic` | `/map` | - | OccupancyGrid topic for free-space probing |
 | `map_free_threshold` | 50 | 0–100 | Occupancy value below which a cell is considered free |
 
 ### Internal Constants (not ROS parameters)
@@ -637,8 +637,8 @@ ros2 param set /pure_pursuit_node <param> <value>
 | Map probe distance | max(clearance+0.4, 1.0) m | How far to scan for walls on each side |
 | Clearance margin | 0.30 m | Min difference for map clearance to override person-side preference |
 | Direction flip threshold | 0.25 m | Min `lat_predicted` crossing needed to change locked avoidance side |
-| Steer alpha (normal) | 0.75 | EMA weight on previous steering — smooth on straights |
-| Steer alpha (avoidance) | 0.50 | EMA weight on previous steering — responsive during avoidance |
+| Steer alpha (normal) | 0.75 | EMA weight on previous steering - smooth on straights |
+| Steer alpha (avoidance) | 0.50 | EMA weight on previous steering - responsive during avoidance |
 
 ---
 
@@ -653,25 +653,25 @@ Fields: `x`, `y` (position, m), `theta` (heading, rad), `v` (velocity, m/s), `L`
 
 ### `PurePursuitController`
 Implements pure pursuit algorithm with curvature-adaptive lookahead.
-- `pure_pursuit_control()` — compute steering angle and target index
-- `look_ahead_point_index()` — find look-ahead point on path
+- `pure_pursuit_control()` - compute steering angle and target index
+- `look_ahead_point_index()` - find look-ahead point on path
 
 ### `PurePursuitNode` (ROS 2 Node)
 Main control node.
 
 | Method | Description |
 |---|---|
-| `control_loop()` | 30 Hz control execution — steering, speed, avoidance ramp |
+| `control_loop()` | 30 Hz control execution - steering, speed, avoidance ramp |
 | `path_callback()` | Receives, smooths, and densifies reference path |
 | `kinematic_state_callback()` | Updates robot pose, heading, velocity |
 | `objects_in_map_frame_callback()` | Person detection, map probing, avoidance decision |
 | `_decide_avoidance_action()` | Computes direction + magnitude from map clearance and person kinematics |
 | `_map_free_clearance()` | Probes inflated OccupancyGrid for free space in a direction |
-| `_clear_obstacle()` | Time-based hold logic — only releases avoidance after 6 s confirmed clear |
+| `_clear_obstacle()` | Time-based hold logic - only releases avoidance after 6 s confirmed clear |
 | `_compute_safe_speed()` | Obstacle-based speed limit (bypassed when `_avoidance_active`) |
 | `_compute_adaptive_L_d()` | Curvature-adaptive lookahead distance |
 | `allowed_to_move_callback()` | Safety interlock |
-| `_check_obstacle_timeout()` | 0.5 Hz watchdog — clears stale detections after 1 s |
+| `_check_obstacle_timeout()` | 0.5 Hz watchdog - clears stale detections after 1 s |
 | `_publish_avoidance_viz()` | RViz trajectory visualisation |
 
 ---
@@ -686,7 +686,7 @@ Main control node.
 |---|---|---|---|---|---|
 | 0 → 1 m | 6.1 | 0.16 | ~1.20 | 13% | Slow start / init |
 | 1 → 2 m | 3.2 | 0.32 | ~1.35 | 24% | Straight section |
-| 2 → 3 m | 0.8 | 1.30 | ~1.30 | 100% | ✅ Fastest — near commanded |
+| 2 → 3 m | 0.8 | 1.30 | ~1.30 | 100% | ✅ Fastest - near commanded |
 | 3 → 4 m | 2.4 | 0.41 | ~1.15 | 36% | Curve entry |
 | 4 → 5 m | 3.3 | 0.30 | ~0.95 | 32% | Curve mid |
 | 5 → 6 m | 3.4 | 0.29 | ~0.90 | 32% | Straight / goal approach |
@@ -719,7 +719,7 @@ CTE statistics (0 – 6 m valid range):
 ## Known Issues and Limitations
 
 ### 1. Speed severely under-commanded
-The motor controller runs open-loop — no wheel speed encoder or velocity feedback to the ESC.
+The motor controller runs open-loop - no wheel speed encoder or velocity feedback to the ESC.
 At 1.4 m/s commanded the car typically achieves only 0.3 – 0.5 m/s (32% average). This will
 not be resolved without closed-loop speed control (encoder + PID on the Arduino).
 
@@ -735,7 +735,7 @@ Increasing `L_d` reduces sensitivity.
 ### 4. Goal not reached (7 m test run)
 At 6.1 m the car hit maximum left steer (−30°) and stopped with CTE = 22.4 cm. The path had
 ended but localization placed the car 0.9 m from the goal. Pure pursuit was chasing a goal
-point the steering geometry could not reach — a localization drift issue, not a controller bug.
+point the steering geometry could not reach - a localization drift issue, not a controller bug.
 
 ### 5. Obstacle avoidance requires forward motion
 Lateral avoidance shifts the lookahead waypoint; pure pursuit then steers toward it. If the
@@ -751,16 +751,16 @@ tracker only provides the closest person for direction, not all obstacles.
 
 ## Safety Features
 
-1. **External stop signal** — `/allowed_to_move = False` stops vehicle immediately
-2. **Person detection** — hard stop at 0.4 m (when not in avoidance); lateral avoidance from 1.5 m
-3. **Avoidance active suppression** — hard stop and slowdown disabled while `_avoidance_active`; car passes, not stops
-4. **Goal tolerance** — stops within 2 cm of target waypoint
-5. **Goal speed ramp** — linearly decelerates to zero over last 0.5 m
-6. **Path validation** — requires ≥ 2 waypoints before moving
-7. **State validation** — waits for `/kinematic_state`; stops if lost for > 3 s
-8. **Obstacle timeout** — resumes and resets avoidance state 1.0 s after last detection
-9. **Avoidance hold** — keeps lateral offset for 6.0 s + 4 s ramp after person leaves corridor
-10. **Direction lock** — committed avoidance side does not oscillate due to noisy tracking
+1. **External stop signal** - `/allowed_to_move = False` stops vehicle immediately
+2. **Person detection** - hard stop at 0.4 m (when not in avoidance); lateral avoidance from 1.5 m
+3. **Avoidance active suppression** - hard stop and slowdown disabled while `_avoidance_active`; car passes, not stops
+4. **Goal tolerance** - stops within 2 cm of target waypoint
+5. **Goal speed ramp** - linearly decelerates to zero over last 0.5 m
+6. **Path validation** - requires ≥ 2 waypoints before moving
+7. **State validation** - waits for `/kinematic_state`; stops if lost for > 3 s
+8. **Obstacle timeout** - resumes and resets avoidance state 1.0 s after last detection
+9. **Avoidance hold** - keeps lateral offset for 6.0 s + 4 s ramp after person leaves corridor
+10. **Direction lock** - committed avoidance side does not oscillate due to noisy tracking
 
 ---
 
@@ -783,29 +783,29 @@ source install/setup.bash
 ## Launch Sequence
 
 ```bash
-# Terminal 1 — System (localization, nav2, arduino, camera TF)
+# Terminal 1 - System (localization, nav2, arduino, camera TF)
 export ROS_DOMAIN_ID=11
 source ~/ros2_ws/install/setup.bash
 ros2 launch ~/ros2_ws/system_startup.launch.py
 
-# Terminal 2 — Camera pipeline
+# Terminal 2 - Camera pipeline
 pkill -9 -f "detectnet"; pkill -9 -f "object_localizer"; pkill -9 -f "realsense2_camera"; sleep 2
 export ROS_DOMAIN_ID=11
 source ~/ros2_ws/install/setup.bash
 ros2 launch object_localizer camera.launch.py
 
-# Terminal 3 — KF object tracker
+# Terminal 3 - KF object tracker
 export ROS_DOMAIN_ID=11
 source ~/ros2_ws/install/setup.bash
 ros2 run kf_object_tracking kf_object_tracker
 
-# Terminal 4 — ros2arduino (start BEFORE pure pursuit — give Arduino 2 s to boot)
+# Terminal 4 - ros2arduino (start BEFORE pure pursuit - give Arduino 2 s to boot)
 export ROS_DOMAIN_ID=11
 source ~/ros2_ws/install/setup.bash
 ros2 run ros2arduino ros2arduino_node &
 sleep 2
 
-# Terminal 5 — Pure pursuit controller
+# Terminal 5 - Pure pursuit controller
 export ROS_DOMAIN_ID=11
 source ~/ros2_ws/install/setup.bash
 ros2 launch control_car pure_persuit.launch.py
@@ -825,12 +825,12 @@ ros2 topic hz /map                      # expect 1 Hz (latched, arrives once)
 
 On a healthy start you should see the following in the pure pursuit terminal:
 
-1. `[pure_pursuit_node] Waiting for /kinematic_state...` — until localization is up
-2. `[pure_pursuit_node] Waiting for /path...` — until planner sends waypoints
-3. `[pure_pursuit_node] Path received: N waypoints` — controller activates
+1. `[pure_pursuit_node] Waiting for /kinematic_state...` - until localization is up
+2. `[pure_pursuit_node] Waiting for /path...` - until planner sends waypoints
+3. `[pure_pursuit_node] Path received: N waypoints` - controller activates
 4. `/ackermann_drive` topic begins publishing at 30 Hz
 
-If the node stays silent after step 3, check `/allowed_to_move` — it must be `True`.
+If the node stays silent after step 3, check `/allowed_to_move` - it must be `True`.
 
 ---
 
@@ -847,7 +847,7 @@ If the node stays silent after step 3, check `/allowed_to_move` — it must be `
 | Car returns to path too quickly | Increase `avoidance_clear_hold` in launch file (default 6.0 s) |
 | Car stays offset too long | Decrease `avoidance_clear_hold` |
 | No `/map` received | Check nav2 or map_server is publishing on the correct topic; default topic is `/map` |
-| ros2arduino crashes | Power brownout: Arduino + ESC share power rail. Start ros2arduino before pure pursuit. Sustained speed > 1.0 m/s may cause USB disconnect — power Arduino via USB separately from motor ESC |
+| ros2arduino crashes | Power brownout: Arduino + ESC share power rail. Start ros2arduino before pure pursuit. Sustained speed > 1.0 m/s may cause USB disconnect - power Arduino via USB separately from motor ESC |
 | No `/kinematic_state` after 3 s | Node stops the car automatically; verify localization stack is running |
 
 ---
@@ -855,13 +855,13 @@ If the node stays silent after step 3, check `/allowed_to_move` — it must be `
 ## Dependencies
 
 **ROS 2 packages:**
-- `ackermann_msgs` — drive commands
-- `curobot_msgs` — KinematicState
-- `nav_msgs` — Path, OccupancyGrid
-- `vision_msgs` — Detection3DArray
-- `visualization_msgs` — Marker, MarkerArray
-- `geometry_msgs` — PoseStamped, Point
-- `std_msgs` — Bool
+- `ackermann_msgs` - drive commands
+- `curobot_msgs` - KinematicState
+- `nav_msgs` - Path, OccupancyGrid
+- `vision_msgs` - Detection3DArray
+- `visualization_msgs` - Marker, MarkerArray
+- `geometry_msgs` - PoseStamped, Point
+- `std_msgs` - Bool
 
 **Python:** `numpy`, `rclpy`, `math`
 
@@ -870,5 +870,5 @@ If the node stays silent after step 3, check `/allowed_to_move` — it must be `
 ## References
 
 1. Coulter, R. C. (1992). *Implementation of the Pure Pursuit Path Tracking Algorithm*. CMU-RI-TR-92-01.
-2. ROS 2 Humble Documentation — https://docs.ros.org/en/humble/
+2. ROS 2 Humble Documentation - https://docs.ros.org/en/humble/
 3. Snider, J. M. (2009). *Automatic Steering Methods for Autonomous Automobile Path Tracking*. CMU-RI-TR-09-08.
